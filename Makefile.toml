@@ -1,0 +1,19 @@
+[config]
+default_to_workspace = false
+
+
+[tasks.test]
+run_task = { name = [
+         "test-node",
+         "test-client",
+], fork = true, parallel = true }
+
+[tasks.test-node]
+cwd = "./node"
+command = "cargo"
+args = ["test"]
+
+[tasks.test-client]
+cwd = "./client"
+command = "cargo"
+args = ["test"]
