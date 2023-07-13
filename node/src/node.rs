@@ -1,39 +1,36 @@
 //! Defines the node struct and provides its APIs
-use lqfs_lib::Fragment;
 use raft::{
     prelude::{Entry, EntryType, Message},
     storage::MemStorage,
-    Config, RawNode,
+    Config, RawNode, StateRole,
 };
-use slog::*;
 
 use std::{
-    collections::HashMap,
-    sync::mpsc::{channel, RecvTimeoutError},
-    thread,
+    sync::{
+        mpsc::{channel, RecvTimeoutError, TryRecvError},
+        MutexGuard,
+    },
     time::{Duration, Instant},
 };
 
-type Callback = Box<dyn Fn() + Send>;
-type Callbacks = HashMap<u8, Box<dyn Fn() + Send>>;
-
-pub enum Msg {
-    Proposal { id: u8, callback: Callback },
-    Raft(Message),
-}
+use crate::{
+    network::{Network, NetworkController},
+    prelude::*,
+};
 
 pub struct Node {
     raft: RawNode<MemStorage>,
-    cbs: Callbacks,
+    id: u64,
+    network: Network,
     logger: Logger,
 }
 
 impl Node {
-    pub fn new() -> Self {
+    pub fn new(id: u64, network: Network, logger: Logger) -> Self {
         // Create the configuration for the Raft node.
         let config = Config {
             // The unique ID for the Raft node.
-            id: 1,
+            id,
             // Election tick is for how long the follower may campaign again after
             // it doesn't receive any message from the leader.
             election_tick: 10,
@@ -55,68 +52,45 @@ impl Node {
 
         let storage = MemStorage::new_with_conf_state((vec![1], vec![]));
 
-        let decorator = slog_term::TermDecorator::new().build();
-        let drain = slog_term::FullFormat::new(decorator).build();
-        let drain = std::sync::Mutex::new(drain).fuse();
-
-        let logger = slog::Logger::root(drain, o!());
-
         let raft = RawNode::new(&config, storage, &logger).unwrap();
 
         Self {
             raft,
-            cbs: HashMap::new(),
+            id,
+            network,
             logger,
         }
     }
 
-    pub fn recv_fragment(frag: Fragment) {
-        todo!()
-    }
-
     pub fn run(&mut self) {
         // We're using a channel, but this could be any stream of events.
-        let (tx, rx) = channel();
-        let timeout = Duration::from_millis(100);
-        let mut remaining_timeout = timeout;
+        let tick_cooldown = Duration::from_millis(100);
 
-        let logger = self.logger.clone();
-        thread::spawn(move || {
-            for i in 0..10 {
-                thread::sleep(Duration::from_millis(1500));
-                info!(logger, "Proposing {i}!");
-                // Send the `tx` somewhere else...
-
-                let logger = logger.clone();
-                tx.send(Msg::Proposal {
-                    id: i,
-                    callback: Box::new(move || info!(logger, "cb {i} called!")),
-                })
-                .unwrap();
-            }
-        });
-
+        let mut now = Instant::now();
         loop {
-            let now = Instant::now();
-
-            match rx.recv_timeout(remaining_timeout) {
-                Ok(Msg::Proposal { id, callback }) => {
-                    self.cbs.insert(id, callback);
-                    let _ = self.raft.propose(vec![], vec![id]);
+            // Keep recieving until there's nothing ready yet,
+            // in which case stop recieving to drive the raft
+            loop {
+                match self.network.lock().unwrap().get_node_rx(self.id).try_recv() {
+                    Ok(m) => self.raft.step(m).unwrap(),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => return,
                 }
-                Ok(Msg::Raft(m)) => self.raft.step(m).unwrap(),
-                Err(RecvTimeoutError::Timeout) => (),
-                Err(RecvTimeoutError::Disconnected) => (),
+            }
+
+            if self.raft.raft.state == StateRole::Leader {
+                let network = self.network.lock().unwrap();
+                for prop_id in network.proposals().keys() {
+                    let _ = self.raft.propose(vec![], prop_id.to_le_bytes().to_vec());
+                }
             }
 
             let elapsed = now.elapsed();
-            if elapsed >= remaining_timeout {
-                remaining_timeout = timeout;
+            if elapsed >= tick_cooldown {
+                now = Instant::now();
                 // We drive Raft every 100ms.
                 self.raft.tick();
                 info!(self.logger, "tick");
-            } else {
-                remaining_timeout -= elapsed;
             }
 
             self.on_ready();
@@ -131,7 +105,10 @@ impl Node {
         let mut ready = self.raft.ready();
 
         if !ready.messages().is_empty() {
-            self.handle_messages(ready.take_messages());
+            self.network
+                .lock()
+                .unwrap()
+                .send_messages(ready.take_messages());
         }
 
         if !ready.snapshot().is_empty() {
@@ -157,7 +134,10 @@ impl Node {
         let mut light_rd = self.raft.advance(ready);
 
         self.handle_commited_entries(light_rd.take_committed_entries());
-        self.handle_messages(light_rd.take_messages());
+        self.network
+            .lock()
+            .unwrap()
+            .send_messages(light_rd.take_messages());
 
         self.raft.advance_apply();
     }
@@ -170,20 +150,16 @@ impl Node {
 
             match entry.get_entry_type() {
                 EntryType::EntryNormal => {
-                    if let Some(cb) = self.cbs.remove(entry.data.first().unwrap()) {
-                        cb();
-                    }
+                    let prop_id = u64::from_le_bytes(
+                        entry.data[0..8]
+                            .try_into()
+                            .expect("Entry data is invalid (incorrect number of bytes)"),
+                    );
+                    self.network.lock().unwrap().apply_proposal(prop_id);
                 }
                 EntryType::EntryConfChange => todo!(),
                 EntryType::EntryConfChangeV2 => todo!(),
             }
-        }
-    }
-
-    fn handle_messages(&self, msgs: Vec<Message>) {
-        for msg in msgs {
-            // TODO: send messages to other peers
-            info!(self.logger, "{msg:?}");
         }
     }
 }
