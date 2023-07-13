@@ -1,7 +1,6 @@
 use uuid::Uuid;
 
 pub mod error;
-pub mod msg;
 
 pub struct Fragment {
     pub data: Vec<u8>,

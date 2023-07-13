@@ -4,7 +4,7 @@ use crate::prelude::*;
 use raft::prelude::Message;
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     sync::{
         mpsc::{self, Receiver, Sender},
         Arc, Mutex, MutexGuard,
@@ -13,10 +13,19 @@ use std::{
     time::Duration,
 };
 
+pub enum NetworkMsg {
+    Control(ControlMsg),
+    Raft(Message),
+}
+
+pub enum ControlMsg {
+    Shutdown,
+}
+
 /// Manages all global state including which nodes are available
 pub struct NetworkController {
-    raft_senders: HashMap<u64, Sender<Message>>,
-    raft_recievers: HashMap<u64, Receiver<Message>>,
+    raft_senders: HashMap<u64, Sender<NetworkMsg>>,
+    raft_recievers: HashMap<u64, Receiver<NetworkMsg>>,
     pub proposals: Arc<Mutex<HashMap<u64, Proposal>>>,
     logger: Logger,
 }
@@ -42,12 +51,24 @@ impl NetworkController {
         }
     }
 
-    pub fn send_messages(&self, msgs: Vec<Message>) {
+    pub fn send_control_message(&self, to: u64, msg: ControlMsg) {
+        if self.raft_senders[&to]
+            .send(NetworkMsg::Control(msg))
+            .is_err()
+        {
+            error!(self.logger, "Failed to send control message to {to}");
+        }
+    }
+
+    pub fn send_raft_messages(&self, msgs: Vec<Message>) {
         for msg in msgs {
             let to = msg.to;
             let from = msg.from;
-            if self.raft_senders[&to].send(msg).is_err() {
-                error!(self.logger, "Failed to send message from {from} to {to}");
+            if self.raft_senders[&to].send(NetworkMsg::Raft(msg)).is_err() {
+                error!(
+                    self.logger,
+                    "Failed to send raft message from {from} to {to}"
+                );
             }
         }
     }
@@ -62,9 +83,14 @@ impl NetworkController {
                 thread::sleep(Duration::from_millis(1500));
                 info!(logger, "Proposing {i}!");
 
-                let prop = Proposal { id: i };
-
+                let (prop, rx) = Proposal::new(i);
                 proposals.lock().unwrap().insert(i, prop);
+
+                info!(
+                    logger,
+                    "Proposal {i} {}",
+                    if rx.recv().unwrap() { "SUCCESS" } else { "FAILURE" }
+                );
             }
         });
     }
@@ -73,16 +99,13 @@ impl NetworkController {
         self.proposals.lock().unwrap()
     }
 
-    pub fn apply_proposal(&self, prop_id: u64) {
-        let prop = self
-            .proposals()
+    pub fn remove_proposal(&self, prop_id: u64) -> Proposal {
+        self.proposals()
             .remove(&prop_id)
-            .expect("Applied proposal should exist");
-
-        info!(self.logger, "Applied proposal {}", prop.id);
+            .expect("Applied proposal should exist")
     }
 
-    pub fn get_node_rx(&self, node_id: u64) -> &Receiver<Message> {
+    pub fn get_node_rx(&self, node_id: u64) -> &Receiver<NetworkMsg> {
         &self.raft_recievers[&node_id]
     }
 }

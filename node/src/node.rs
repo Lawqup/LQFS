@@ -1,20 +1,17 @@
 //! Defines the node struct and provides its APIs
 use raft::{
-    prelude::{Entry, EntryType, Message},
+    prelude::{Entry, EntryType},
     storage::MemStorage,
     Config, RawNode, StateRole,
 };
 
 use std::{
-    sync::{
-        mpsc::{channel, RecvTimeoutError, TryRecvError},
-        MutexGuard,
-    },
+    sync::mpsc::TryRecvError,
     time::{Duration, Instant},
 };
 
 use crate::{
-    network::{Network, NetworkController},
+    network::{ControlMsg, Network, NetworkMsg},
     prelude::*,
 };
 
@@ -72,7 +69,13 @@ impl Node {
             // in which case stop recieving to drive the raft
             loop {
                 match self.network.lock().unwrap().get_node_rx(self.id).try_recv() {
-                    Ok(m) => self.raft.step(m).unwrap(),
+                    Ok(NetworkMsg::Raft(m)) => self.raft.step(m).unwrap(),
+                    Ok(NetworkMsg::Control(ctl)) => match ctl {
+                        ControlMsg::Shutdown => {
+                            info!(self.logger, "Shutting down node {}", self.id);
+                            return;
+                        }
+                    },
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => return,
                 }
@@ -80,8 +83,8 @@ impl Node {
 
             if self.raft.raft.state == StateRole::Leader {
                 let network = self.network.lock().unwrap();
-                for prop_id in network.proposals().keys() {
-                    let _ = self.raft.propose(vec![], prop_id.to_le_bytes().to_vec());
+                for prop in network.proposals().values() {
+                    Self::propose(&mut self.raft, prop);
                 }
             }
 
@@ -97,6 +100,16 @@ impl Node {
         }
     }
 
+    fn propose(raft: &mut RawNode<MemStorage>, prop: &Proposal) {
+        let n_entries = raft.raft.raft_log.last_index();
+        let _ = raft.propose(vec![], prop.id.to_le_bytes().to_vec());
+
+        if n_entries == raft.raft.raft_log.last_index() {
+            // Log didn't grow, so proposal failed
+            prop.status_success.send(false).unwrap();
+        }
+    }
+
     fn on_ready(&mut self) {
         if !self.raft.has_ready() {
             return;
@@ -108,7 +121,7 @@ impl Node {
             self.network
                 .lock()
                 .unwrap()
-                .send_messages(ready.take_messages());
+                .send_raft_messages(ready.take_messages());
         }
 
         if !ready.snapshot().is_empty() {
@@ -137,7 +150,7 @@ impl Node {
         self.network
             .lock()
             .unwrap()
-            .send_messages(light_rd.take_messages());
+            .send_raft_messages(light_rd.take_messages());
 
         self.raft.advance_apply();
     }
@@ -148,18 +161,94 @@ impl Node {
                 continue;
             }
 
+            let prop_id = u64::from_le_bytes(
+                entry.data[0..8]
+                    .try_into()
+                    .expect("Entry data is invalid (incorrect number of bytes)"),
+            );
+
+            let prop = self.network.lock().unwrap().remove_proposal(prop_id);
+
             match entry.get_entry_type() {
-                EntryType::EntryNormal => {
-                    let prop_id = u64::from_le_bytes(
-                        entry.data[0..8]
-                            .try_into()
-                            .expect("Entry data is invalid (incorrect number of bytes)"),
-                    );
-                    self.network.lock().unwrap().apply_proposal(prop_id);
-                }
+                EntryType::EntryNormal => info!(self.logger, "Applied proposal {prop_id}"),
                 EntryType::EntryConfChange => todo!(),
                 EntryType::EntryConfChangeV2 => todo!(),
             }
+
+            if self.raft.raft.state == StateRole::Leader {
+                prop.status_success.send(true).unwrap();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::{
+        sync::{Arc, Mutex},
+        thread,
+    };
+
+    use ntest::{test_case, timeout};
+
+    use crate::{
+        network::{ControlMsg, Network, NetworkController},
+        prelude::*,
+    };
+
+    use super::Node;
+
+    fn send_proposals(peers: &[u64], logger: Logger, network: Network) {
+        let peers = peers.to_vec();
+        thread::spawn(move || {
+            let n_success = (0..100)
+                .filter(|&i| {
+                    let (prop, rx) = Proposal::new(i);
+                    network.lock().unwrap().proposals().insert(i, prop);
+
+                    let res = rx.recv().unwrap();
+                    info!(
+                        logger,
+                        "Proposal {i} {}",
+                        if res { "SUCCESS" } else { "FAILURE" }
+                    );
+                    res
+                })
+                .count();
+
+            for id in peers {
+                network
+                    .lock()
+                    .unwrap()
+                    .send_control_message(id, ControlMsg::Shutdown);
+            }
+            assert_eq!(100, n_success);
+            assert!(network.lock().unwrap().proposals().is_empty());
+        });
+    }
+
+    #[test_case(1)]
+    #[test_case(5)]
+    #[timeout(2000)]
+    fn simple_proposals(n_peers: u64) {
+        let peers: Vec<u64> = (1..=n_peers).collect();
+        let logger = build_debug_logger();
+        let network = Arc::new(Mutex::new(NetworkController::new(&peers, logger.clone())));
+
+        let mut handles = Vec::new();
+        for &id in peers.iter() {
+            let network = network.clone();
+            let logger = logger.clone();
+            handles.push(thread::spawn(move || {
+                let mut node = Node::new(id, network, logger);
+                node.run();
+            }));
+        }
+
+        send_proposals(&peers, logger, network);
+
+        for handle in handles {
+            handle.join().expect("Handle could not be joined");
         }
     }
 }

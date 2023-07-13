@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 mod network;
 mod node;
 mod prelude;
@@ -12,13 +14,8 @@ use node::Node;
 use prelude::*;
 
 fn main() {
-    let decorator = slog_term::TermDecorator::new().build();
-    let drain = slog_term::FullFormat::new(decorator).build();
-    let drain = std::sync::Mutex::new(drain).fuse();
-
-    let logger = slog::Logger::root(drain, o!());
-
     let peers = [1, 2, 4];
+    let logger = build_default_logger();
     let network = Arc::new(Mutex::new(NetworkController::new(&peers, logger.clone())));
 
     let mut handles = Vec::new();
