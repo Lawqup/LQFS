@@ -7,33 +7,49 @@ use std::{
     collections::HashMap,
     sync::{
         mpsc::{self, Receiver, Sender},
-        Arc, Mutex, MutexGuard,
+        Arc, Mutex,
     },
     thread,
     time::Duration,
 };
 
-pub enum NetworkMsg {
-    Control(ControlMsg),
+pub enum RequestMsg {
+    Control(Signal),
+    Propose(Proposal),
     Raft(Message),
 }
 
-pub enum ControlMsg {
+pub enum Signal {
     Shutdown,
+}
+
+pub enum ResponseMsg {
+    ProposalFailure,
+    ProposalSuccess,
+}
+
+pub struct Response {
+    pub client_id: u64,
+    pub proposal_id: u64,
+    pub msg: ResponseMsg,
 }
 
 /// Manages all global state including which nodes are available
 pub struct NetworkController {
-    raft_senders: HashMap<u64, Sender<NetworkMsg>>,
-    raft_recievers: HashMap<u64, Receiver<NetworkMsg>>,
-    pub proposals: Arc<Mutex<HashMap<u64, Proposal>>>,
+    pub raft_senders: HashMap<u64, Sender<RequestMsg>>,
+    raft_recievers: HashMap<u64, Receiver<RequestMsg>>,
+    client_senders: HashMap<u64, Sender<Response>>,
     logger: Logger,
 }
 
 pub type Network = Arc<Mutex<NetworkController>>;
 
 impl NetworkController {
-    pub fn new(peers: &[u64], logger: Logger) -> Self {
+    pub fn new(
+        peers: &[u64],
+        clients: &[u64],
+        logger: Logger,
+    ) -> (Self, HashMap<u64, Receiver<Response>>) {
         let (raft_senders, raft_recievers) = peers
             .iter()
             .copied()
@@ -43,17 +59,29 @@ impl NetworkController {
             })
             .unzip();
 
-        Self {
-            raft_senders,
-            raft_recievers,
-            proposals: Arc::new(Mutex::new(HashMap::new())),
-            logger,
-        }
+        let (client_senders, client_recievers) = clients
+            .iter()
+            .copied()
+            .map(|id| {
+                let (tx, rx) = mpsc::channel();
+                ((id, tx), (id, rx))
+            })
+            .unzip();
+
+        (
+            Self {
+                raft_senders,
+                raft_recievers,
+                client_senders,
+                logger,
+            },
+            client_recievers,
+        )
     }
 
-    pub fn send_control_message(&self, to: u64, msg: ControlMsg) {
+    pub fn send_control_message(&self, to: u64, msg: Signal) {
         if self.raft_senders[&to]
-            .send(NetworkMsg::Control(msg))
+            .send(RequestMsg::Control(msg))
             .is_err()
         {
             error!(self.logger, "Failed to send control message to {to}");
@@ -64,7 +92,7 @@ impl NetworkController {
         for msg in msgs {
             let to = msg.to;
             let from = msg.from;
-            if self.raft_senders[&to].send(NetworkMsg::Raft(msg)).is_err() {
+            if self.raft_senders[&to].send(RequestMsg::Raft(msg)).is_err() {
                 error!(
                     self.logger,
                     "Failed to send raft message from {from} to {to}"
@@ -74,38 +102,32 @@ impl NetworkController {
     }
 
     pub fn listen_for_proposals(&mut self) {
-        let proposals = self.proposals.clone();
         let logger = self.logger.clone();
+        let raft_senders = self.raft_senders.clone();
+        let clients: Vec<u64> = self.client_senders.keys().copied().collect();
         thread::spawn(move || {
             // TODO set up an endpoint and listen to client
 
-            for i in 0..10 {
+            for (i, c) in (0..10).zip(clients.into_iter().cycle()) {
                 thread::sleep(Duration::from_millis(1500));
                 info!(logger, "Proposing {i}!");
 
-                let (prop, rx) = Proposal::new(i);
-                proposals.lock().unwrap().insert(i, prop);
+                let prop = Proposal::new(i, c);
 
-                info!(
-                    logger,
-                    "Proposal {i} {}",
-                    if rx.recv().unwrap() { "SUCCESS" } else { "FAILURE" }
-                );
+                for tx in raft_senders.values() {
+                    tx.send(RequestMsg::Propose(prop)).unwrap();
+                }
             }
         });
     }
 
-    pub fn proposals(&self) -> MutexGuard<HashMap<u64, Proposal>> {
-        self.proposals.lock().unwrap()
+    pub fn respond_to_client(&self, response: Response) {
+        self.client_senders[&response.client_id]
+            .send(response)
+            .unwrap();
     }
 
-    pub fn remove_proposal(&self, prop_id: u64) -> Proposal {
-        self.proposals()
-            .remove(&prop_id)
-            .expect("Applied proposal should exist")
-    }
-
-    pub fn get_node_rx(&self, node_id: u64) -> &Receiver<NetworkMsg> {
+    pub fn get_node_rx(&self, node_id: u64) -> &Receiver<RequestMsg> {
         &self.raft_recievers[&node_id]
     }
 }

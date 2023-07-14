@@ -15,8 +15,11 @@ use prelude::*;
 
 fn main() {
     let peers = [1, 2, 4];
+    let clients = [1];
     let logger = build_default_logger();
-    let network = Arc::new(Mutex::new(NetworkController::new(&peers, logger.clone())));
+    let (network, client_rxs) = NetworkController::new(&peers, &clients, logger.clone());
+
+    let network = Arc::new(Mutex::new(network));
 
     let mut handles = Vec::new();
     for id in peers {

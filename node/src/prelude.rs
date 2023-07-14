@@ -1,20 +1,17 @@
-use std::sync::{
-    mpsc::{self, Receiver, Sender},
-    Mutex,
-};
+use std::sync::Mutex;
 
 pub use slog::*;
 
+#[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy, Debug)]
+#[repr(C)]
 pub struct Proposal {
     pub id: u64,
-    pub status_success: Sender<bool>,
+    pub client_id: u64,
 }
 
 impl Proposal {
-    pub fn new(id: u64) -> (Self, Receiver<bool>) {
-        let (status_success, rx) = mpsc::channel();
-
-        (Self { id, status_success }, rx)
+    pub fn new(id: u64, client_id: u64) -> Self {
+        Self { id, client_id }
     }
 }
 pub fn build_default_logger() -> Logger {
