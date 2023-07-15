@@ -2,12 +2,13 @@
 
 use crate::prelude::*;
 use raft::prelude::Message;
+use uuid::Uuid;
 
 use std::{
     collections::HashMap,
     sync::{
         mpsc::{self, Receiver, Sender},
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard,
     },
     thread,
     time::Duration,
@@ -29,8 +30,9 @@ pub enum ResponseMsg {
 }
 
 pub struct Response {
-    pub client_id: u64,
-    pub proposal_id: u64,
+    pub to: u64,
+    pub from: u64,
+    pub proposal_id: Uuid,
     pub msg: ResponseMsg,
 }
 
@@ -38,7 +40,7 @@ pub struct Response {
 pub struct NetworkController {
     pub raft_senders: HashMap<u64, Sender<RequestMsg>>,
     raft_recievers: HashMap<u64, Receiver<RequestMsg>>,
-    client_senders: HashMap<u64, Sender<Response>>,
+    client_responders: HashMap<u64, Sender<Response>>,
     logger: Logger,
 }
 
@@ -72,7 +74,7 @@ impl NetworkController {
             Self {
                 raft_senders,
                 raft_recievers,
-                client_senders,
+                client_responders: client_senders,
                 logger,
             },
             client_recievers,
@@ -92,6 +94,7 @@ impl NetworkController {
         for msg in msgs {
             let to = msg.to;
             let from = msg.from;
+
             if self.raft_senders[&to].send(RequestMsg::Raft(msg)).is_err() {
                 error!(
                     self.logger,
@@ -104,30 +107,32 @@ impl NetworkController {
     pub fn listen_for_proposals(&mut self) {
         let logger = self.logger.clone();
         let raft_senders = self.raft_senders.clone();
-        let clients: Vec<u64> = self.client_senders.keys().copied().collect();
+        let clients: Vec<u64> = self.client_responders.keys().copied().collect();
         thread::spawn(move || {
             // TODO set up an endpoint and listen to client
 
             for (i, c) in (0..10).zip(clients.into_iter().cycle()) {
                 thread::sleep(Duration::from_millis(1500));
-                info!(logger, "Proposing {i}!");
 
-                let prop = Proposal::new(i, c);
+                info!(logger, "Proposing {i}!");
+                let prop = &Proposal::new_fragment(c, vec![]);
 
                 for tx in raft_senders.values() {
-                    tx.send(RequestMsg::Propose(prop)).unwrap();
+                    tx.send(RequestMsg::Propose(prop.clone())).unwrap();
                 }
             }
         });
     }
 
-    pub fn respond_to_client(&self, response: Response) {
-        self.client_senders[&response.client_id]
-            .send(response)
-            .unwrap();
-    }
-
     pub fn get_node_rx(&self, node_id: u64) -> &Receiver<RequestMsg> {
         &self.raft_recievers[&node_id]
+    }
+
+    pub fn respond_to_client(&self, response: Response) {
+        self.client_responders[&response.to].send(response).unwrap();
+    }
+
+    pub fn peers(&self) -> Vec<u64> {
+        self.raft_senders.keys().copied().collect()
     }
 }
