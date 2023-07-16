@@ -65,7 +65,7 @@ impl Node {
         let storage = MemStorage::new();
         storage.wl().apply_snapshot(s).unwrap();
 
-        let raft = Some(RawNode::new(&config, storage, &logger).unwrap());
+        let mut raft = Some(RawNode::new(&config, storage, &logger).unwrap());
 
         let mut followers_to_add = VecDeque::new();
 
@@ -75,6 +75,7 @@ impl Node {
             }
         }
 
+        raft.as_mut().unwrap().campaign().unwrap();
         Self {
             raft,
             network,
@@ -537,7 +538,7 @@ mod test {
 
         let (_, node_handles) = init_nodes(&peers, &logger, &network);
 
-        thread::sleep(Duration::from_millis(2000));
+        thread::sleep(Duration::from_millis(3000));
 
         let mut client_handles = Vec::new();
         for client_id in clients {
@@ -550,7 +551,6 @@ mod test {
             ));
         }
 
-        thread::sleep(Duration::from_millis(200));
         network
             .lock()
             .unwrap()
