@@ -8,7 +8,7 @@ use std::{
     collections::HashMap,
     sync::{
         mpsc::{self, Receiver, Sender},
-        Arc, Mutex, MutexGuard,
+        Arc, Mutex,
     },
     thread,
     time::Duration,
@@ -24,6 +24,7 @@ pub enum Signal {
     Shutdown,
 }
 
+#[derive(PartialEq)]
 pub enum ResponseMsg {
     ProposalFailure,
     ProposalSuccess,
