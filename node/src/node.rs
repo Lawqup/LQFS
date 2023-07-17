@@ -3,18 +3,13 @@ use raft::{prelude::*, storage::MemStorage, Config, RawNode, StateRole};
 
 use protobuf::Message as PbMessage;
 use std::{
-    collections::{HashMap, VecDeque},
-    sync::{
-        mpsc::{self, Sender, TryRecvError},
-        Arc, Mutex,
-    },
-    thread,
+    collections::VecDeque,
+    sync::mpsc::TryRecvError,
     time::{Duration, Instant},
 };
-use uuid::Uuid;
 
 use crate::{
-    network::{Network, RequestMsg, Response, ResponseMsg, Signal},
+    network::{Network, QueryMsg, RequestMsg, Response, ResponseMsg, Signal},
     prelude::*,
 };
 
@@ -60,7 +55,7 @@ impl Node {
         let mut s = Snapshot::default();
         s.mut_metadata().index = 1;
         s.mut_metadata().term = 1;
-        s.mut_metadata().mut_conf_state().voters = vec![1];
+        s.mut_metadata().mut_conf_state().voters = vec![id];
 
         let storage = MemStorage::new();
         storage.wl().apply_snapshot(s).unwrap();
@@ -129,27 +124,26 @@ impl Node {
             // Keep recieving until there's nothing ready yet,
             // in which case stop recieving to drive the raft
             loop {
-                match network_clone
-                    .lock()
-                    .unwrap()
-                    .get_node_rx(self.id)
-                    .try_recv()
-                {
+                let network = network_clone.lock().unwrap();
+                match network.get_node_rx(self.id).try_recv() {
                     Ok(RequestMsg::Raft(m)) => {
                         self.step(m);
                     }
-                    // TODO: how are followers going to get the conf change
-                    // if they need to be leader to accept proposals?
                     Ok(RequestMsg::Propose(p)) => {
-                        if self
-                            .raft
-                            .as_ref()
-                            .is_some_and(|r| r.raft.state == StateRole::Leader)
-                        {
+                        if self.is_leader() {
                             info!(self.logger, "Recieved proposal from {}", p.from);
                             self.propose(&p);
                         }
                     }
+                    Ok(RequestMsg::Query(q)) => match q {
+                        QueryMsg::IsInitialized { from } => {
+                            network.respond_to_client(Response {
+                                to: from,
+                                from: self.id,
+                                msg: ResponseMsg::Initialized(self.raft.is_some()),
+                            });
+                        }
+                    },
                     Ok(RequestMsg::Control(ctl)) => match ctl {
                         Signal::Shutdown => {
                             info!(self.logger, "Shutting down");
@@ -188,6 +182,12 @@ impl Node {
         }
     }
 
+    fn is_leader(&self) -> bool {
+        self.raft
+            .as_ref()
+            .is_some_and(|r| r.raft.state == StateRole::Leader)
+    }
+
     fn propose(&mut self, prop: &Proposal) {
         let index_before = self.raft_mut().raft.raft_log.last_index();
         let ctx = prop.context_bytes();
@@ -202,10 +202,12 @@ impl Node {
             if prop.is_fragment() {
                 // Fragment proposals come from client, so respond over network
                 let resp = Response {
-                    proposal_id: prop.id,
                     to: prop.from,
                     from: self.id,
-                    msg: ResponseMsg::ProposalFailure,
+                    msg: ResponseMsg::Proposed {
+                        proposal_id: prop.id,
+                        success: false,
+                    },
                 };
                 self.network.lock().unwrap().respond_to_client(resp);
             }
@@ -229,12 +231,12 @@ impl Node {
                 .send_raft_messages(ready.take_messages());
         }
 
-        if *ready.snapshot() != Snapshot::default() {
+        if !ready.snapshot().is_empty() {
             let s = ready.snapshot().clone();
             if let Err(e) = store.wl().apply_snapshot(s) {
                 error!(
                     self.logger,
-                    "Apply snapshot fail: {:?}, need to retry or panic", e
+                    "Apply snapshot failed: {:?}, need to retry or panic", e
                 );
                 return;
             }
@@ -312,10 +314,12 @@ impl Node {
             if self.raft_mut().raft.state == StateRole::Leader {
                 if entry.get_entry_type() == EntryType::EntryNormal {
                     let resp = Response {
-                        proposal_id: prop_id,
                         to: prop_from,
                         from: self.id,
-                        msg: ResponseMsg::ProposalSuccess,
+                        msg: ResponseMsg::Proposed {
+                            proposal_id: prop_id,
+                            success: true,
+                        },
                     };
                     self.network.lock().unwrap().respond_to_client(resp);
                 } else {
@@ -329,7 +333,7 @@ impl Node {
 #[cfg(test)]
 mod test {
     use std::{
-        collections::HashMap,
+        collections::{HashMap, HashSet},
         sync::{mpsc::Receiver, Arc, Mutex},
         thread::{self, JoinHandle},
         time::Duration,
@@ -339,7 +343,9 @@ mod test {
     use raft::StateRole;
 
     use crate::{
-        network::{Network, NetworkController, RequestMsg, Response, ResponseMsg, Signal},
+        network::{
+            Network, NetworkController, QueryMsg, RequestMsg, Response, ResponseMsg, Signal,
+        },
         prelude::*,
     };
 
@@ -347,46 +353,77 @@ mod test {
 
     const CLIENT_TIMEOUT: Duration = Duration::from_millis(5000);
 
-    fn init_nodes(
-        peers: &[u64],
-        logger: &Logger,
-        network: &Network,
-    ) -> (Vec<Arc<Mutex<Node>>>, Vec<JoinHandle<()>>) {
-        let mut handles = Vec::new();
-        let mut nodes = Vec::new();
+    struct InitResult {
+        network: Network,
+        client_rxs: HashMap<u64, Receiver<Response>>,
+        node_handles: Vec<JoinHandle<Node>>,
+    }
+
+    fn init_cluster(peers: &[u64], clients: &[u64], logger: &Logger) -> InitResult {
+        let technician = clients.iter().max().copied().unwrap_or_default() + 1;
+        let c_augment = [&[technician], clients].concat();
+
+        let (network, mut client_rxs) = NetworkController::new(&peers, &c_augment, logger.clone());
+
+        let network = Arc::new(Mutex::new(network));
+        let mut node_handles = Vec::new();
 
         for &id in peers.iter().skip(1) {
             let network = network.clone();
             let logger = logger.clone();
-
-            let node = Arc::new(Mutex::new(Node::new_follower(id, network, &logger)));
-
-            let node_clone = node.clone();
-            nodes.push(node);
-            handles.push(thread::spawn(move || {
+            node_handles.push(thread::spawn(move || {
                 info!(&logger, "Starting follower (id: {id})");
-                node_clone.lock().unwrap().run();
+                let mut node = Node::new_follower(id, network, &logger);
+                node.run();
+                node
             }));
         }
 
         let leader_id = peers[0];
 
         let logger_clone = logger.clone();
-        let leader = Arc::new(Mutex::new(Node::new_leader(
-            leader_id,
-            network.clone(),
-            &logger,
-        )));
-
-        let leader_clone = leader.clone();
-        let leader_clone2 = leader.clone();
-        nodes.push(leader);
-        handles.push(thread::spawn(move || {
+        let network_clone = network.clone();
+        node_handles.push(thread::spawn(move || {
             info!(logger_clone, "Starting leader (id: {leader_id})");
-            leader_clone.lock().unwrap().run();
+            let mut leader = Node::new_leader(leader_id, network_clone, &logger_clone);
+            leader.run();
+            leader
         }));
 
-        (nodes, handles)
+        // TODO: figure out how to determine if leader is elected
+
+        let mut still_uninit: HashSet<u64> = peers.into_iter().copied().collect();
+        while !still_uninit.is_empty() {
+            let mut to_remove = Vec::new();
+
+            for node in still_uninit.iter().copied() {
+                network
+                    .lock()
+                    .unwrap()
+                    .send_query_message(node, QueryMsg::IsInitialized { from: technician });
+                match client_rxs[&technician].recv().unwrap().msg {
+                    ResponseMsg::Initialized(true) => {
+                        to_remove.push(node);
+                    }
+                    ResponseMsg::Initialized(false) => (),
+                    _ => panic!("Incorrect response variant recieved"),
+                }
+            }
+
+            for node in to_remove.iter() {
+                still_uninit.remove(node);
+            }
+            to_remove.clear();
+
+            thread::sleep(Duration::from_millis(200));
+        }
+
+        client_rxs.remove(&technician);
+        InitResult {
+            network,
+            client_rxs,
+            node_handles,
+        }
     }
 
     fn spawn_client(
@@ -429,18 +466,28 @@ mod test {
                 );
 
                 let res = res.unwrap();
-                proposals.lock().unwrap().remove(&res.proposal_id);
-                assert_eq!(res.to, client_id);
-                info!(
-                    logger,
-                    "Proposal ({}, {}) {}",
-                    res.proposal_id,
-                    res.to,
-                    match res.msg {
-                        ResponseMsg::ProposalFailure => "FAILURE",
-                        ResponseMsg::ProposalSuccess => "SUCCESS",
+                match res.msg {
+                    ResponseMsg::Proposed {
+                        proposal_id,
+                        success,
+                    } => {
+                        proposals
+                            .lock()
+                            .unwrap()
+                            .remove(&proposal_id)
+                            .expect("Proposal didn't exist in the queue.");
+
+                        assert_eq!(res.to, client_id);
+                        info!(
+                            logger,
+                            "Proposal ({}, {}) {}",
+                            proposal_id,
+                            res.to,
+                            if success { "SUCCESS" } else { "FAILURE" }
+                        );
                     }
-                );
+                    _ => panic!("Incorrect response variant recieved"),
+                }
             }
         })
     }
@@ -453,14 +500,13 @@ mod test {
         let peers: Vec<u64> = (1..=n_peers).collect();
         let logger = build_debug_logger();
 
-        let (network, _) = NetworkController::new(&peers, &[], logger.clone());
-        let network = Arc::new(Mutex::new(network));
+        let InitResult {
+            network,
+            node_handles,
+            ..
+        } = init_cluster(&peers, &[], &logger);
 
-        let (nodes, node_handles) = init_nodes(&peers, &logger, &network);
-
-        thread::sleep(Duration::from_millis(3000));
-
-        for id in peers {
+        for id in peers.clone() {
             network
                 .lock()
                 .unwrap()
@@ -469,19 +515,20 @@ mod test {
 
         let mut n_leaders = 0;
         let mut n_followers = 0;
-        for (handle, node) in node_handles.into_iter().zip(nodes.into_iter()) {
-            handle.join().expect("Handle could not be joined");
+        for handle in node_handles {
+            let node = handle.join().expect("Handle could not be joined");
 
-            let node = node.lock().unwrap();
-            if node.raft.as_ref().unwrap().raft.state == StateRole::Leader {
-                n_leaders += 1;
-            } else if node.raft.as_ref().unwrap().raft.state == StateRole::Follower {
-                n_followers += 1;
+            assert!(node.raft.is_some());
+
+            match node.raft().raft.state {
+                StateRole::Leader => n_leaders += 1,
+                StateRole::Follower => n_followers += 1,
+                _ => (),
             }
         }
 
-        assert_eq!(n_leaders, 1);
-        assert_eq!(n_followers, n_peers - 1);
+        assert_eq!(1, n_leaders);
+        assert_eq!(peers.len() - 1, n_followers);
     }
 
     #[test_case(1, 1, name = "single_node_1_client_simple")]
@@ -493,10 +540,12 @@ mod test {
         let clients: Vec<u64> = (1..=n_clients).collect();
         let logger = build_debug_logger();
 
-        let (network, mut client_rxs) = NetworkController::new(&peers, &clients, logger.clone());
-        let network = Arc::new(Mutex::new(network));
-
-        let (_, node_handles) = init_nodes(&peers, &logger, &network);
+        let InitResult {
+            network,
+            node_handles,
+            mut client_rxs,
+            ..
+        } = init_cluster(&peers, &clients, &logger);
 
         let mut client_handles = Vec::new();
         for client_id in clients {
@@ -533,12 +582,12 @@ mod test {
         let clients: Vec<u64> = (1..=n_clients).collect();
         let logger = build_debug_logger();
 
-        let (network, mut client_rxs) = NetworkController::new(&peers, &clients, logger.clone());
-        let network = Arc::new(Mutex::new(network));
-
-        let (_, node_handles) = init_nodes(&peers, &logger, &network);
-
-        thread::sleep(Duration::from_millis(3000));
+        let InitResult {
+            network,
+            node_handles,
+            mut client_rxs,
+            ..
+        } = init_cluster(&peers, &clients, &logger);
 
         let mut client_handles = Vec::new();
         for client_id in clients {

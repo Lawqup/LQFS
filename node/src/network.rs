@@ -14,10 +14,20 @@ use std::{
     time::Duration,
 };
 
+/// RequestMsgs are all messages sent to nodes
 pub enum RequestMsg {
+    /// Signals that don't require consensus and don't return a response
     Control(Signal),
+    /// Queries that don't require consensus and return a response
+    Query(QueryMsg),
+    /// Proposals that require consensus and return a response
     Propose(Proposal),
+    /// Intra-node messages that carry out drive consensus
     Raft(Message),
+}
+
+pub enum QueryMsg {
+    IsInitialized { from: u64 },
 }
 
 pub enum Signal {
@@ -26,14 +36,13 @@ pub enum Signal {
 
 #[derive(PartialEq)]
 pub enum ResponseMsg {
-    ProposalFailure,
-    ProposalSuccess,
+    Proposed { proposal_id: Uuid, success: bool },
+    Initialized(bool),
 }
 
 pub struct Response {
     pub to: u64,
     pub from: u64,
-    pub proposal_id: Uuid,
     pub msg: ResponseMsg,
 }
 
@@ -88,6 +97,12 @@ impl NetworkController {
             .is_err()
         {
             error!(self.logger, "Failed to send control message to {to}");
+        }
+    }
+
+    pub fn send_query_message(&self, to: u64, msg: QueryMsg) {
+        if self.raft_senders[&to].send(RequestMsg::Query(msg)).is_err() {
+            error!(self.logger, "Failed to send query message to {to}");
         }
     }
 
