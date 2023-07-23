@@ -2,6 +2,7 @@ use std::sync::Mutex;
 
 use raft::prelude::ConfChange;
 pub use slog::{debug, error, info, o, Drain, Logger};
+use thiserror::Error as ThisError;
 pub use uuid::Uuid;
 
 #[derive(Clone, Debug)]
@@ -61,3 +62,26 @@ pub fn build_debug_logger() -> Logger {
 
     Logger::root(drain, o!())
 }
+
+#[derive(Debug, ThisError)]
+pub enum Error {
+    #[error("raft error: `{0}`")]
+    Raft(#[from] raft::Error),
+    #[error("io error: `{0}`")]
+    Io(#[from] std::io::Error),
+    #[error("database error: `{0}`")]
+    Database(#[from] persy::PersyError),
+    #[error("node init error")]
+    InitError,
+}
+
+impl<T: Into<persy::PersyError>> From<persy::PE<T>> for Error {
+    fn from(err: persy::PE<T>) -> Error {
+        Error::Database(err.error().into())
+    }
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Debug, Clone)]
+pub struct W<T>(T);

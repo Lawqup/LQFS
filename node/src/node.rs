@@ -92,11 +92,11 @@ impl Node {
         }
     }
 
-    pub fn init_from_message(&mut self, msg: &Message) -> Result<(), ()> {
+    pub fn init_from_message(&mut self, msg: &Message) -> Result<()> {
         match msg.msg_type {
             MessageType::MsgRequestVote | MessageType::MsgRequestPreVote => {}
             MessageType::MsgHeartbeat if msg.commit == 0 => {}
-            _ => return Err(()),
+            _ => return Err(Error::InitError),
         }
 
         let mut config = Self::config();
@@ -110,7 +110,7 @@ impl Node {
         if self.raft.is_none() {
             match self.init_from_message(&msg) {
                 Ok(()) => {}
-                Err(()) => return,
+                Err(_) => return,
             }
         }
 
@@ -389,8 +389,6 @@ mod test {
             leader.run();
             leader
         }));
-
-        // TODO: figure out how to determine if leader is elected
 
         let mut still_uninit: HashSet<u64> = peers.into_iter().copied().collect();
         while !still_uninit.is_empty() {
