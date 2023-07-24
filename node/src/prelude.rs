@@ -1,5 +1,6 @@
 use std::sync::Mutex;
 
+use protobuf::ProtobufError;
 use raft::prelude::ConfChange;
 pub use slog::{debug, error, info, o, Drain, Logger};
 use thiserror::Error as ThisError;
@@ -71,8 +72,16 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("database error: `{0}`")]
     Database(#[from] persy::PersyError),
+    #[error("serialization error: `{0}`")]
+    SerialError(#[from] ProtobufError),
+    #[error("unkown error: `{0}`")]
+    Other(#[source] Box<dyn std::error::Error + Sync + Send + 'static>),
+    #[error("conversion error")]
+    ConverstionError,
     #[error("node init error")]
     InitError,
+    #[error("key error")]
+    KeyError,
 }
 
 impl<T: Into<persy::PersyError>> From<persy::PE<T>> for Error {
@@ -83,5 +92,15 @@ impl<T: Into<persy::PersyError>> From<persy::PE<T>> for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Debug, Clone)]
-pub struct W<T>(T);
+pub trait MyInto<T> {
+    fn my_into(self) -> T;
+}
+
+impl<T, E> MyInto<Result<T>> for std::result::Result<T, E>
+where
+    E: Into<Error>,
+{
+    fn my_into(self) -> Result<T> {
+        self.map_err(|e| e.into())
+    }
+}
