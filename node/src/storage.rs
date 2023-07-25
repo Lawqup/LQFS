@@ -196,9 +196,9 @@ impl NodeStorageCore {
     }
 }
 
-struct NodeStore(Arc<RwLock<NodeStorageCore>>);
+struct NodeStorage(Arc<RwLock<NodeStorageCore>>);
 
-impl NodeStore {
+impl NodeStorage {
     pub fn create(id: u64) -> Result<Self> {
         let core = NodeStorageCore::create(id)?;
         Ok(Self(Arc::new(RwLock::new(core))))
@@ -212,10 +212,10 @@ impl NodeStore {
         self.0.read().unwrap()
     }
 }
-impl Storage for NodeStore {
+
+impl Storage for NodeStorage {
     fn initial_state(&self) -> raft::Result<RaftState> {
         let store = self.rl();
-
         let mut tx = store
             .persy
             .begin()
@@ -230,6 +230,11 @@ impl Storage for NodeStore {
                 .map_err(|e| raft::Error::Store(raft::StorageError::Other(e.into())))?,
         };
 
+        tx.prepare()
+            .map_err(|e| raft::Error::Store(raft::StorageError::Other(e.into())))?
+            .commit()
+            .map_err(|e| raft::Error::Store(raft::StorageError::Other(e.into())))?;
+
         Ok(state)
     }
 
@@ -238,25 +243,119 @@ impl Storage for NodeStore {
         low: u64,
         high: u64,
         max_size: impl Into<Option<u64>>,
-        context: raft::GetEntriesContext,
+        _context: raft::GetEntriesContext,
     ) -> raft::Result<Vec<Entry>> {
-        todo!()
+        let store = self.rl();
+        let mut tx = store
+            .persy
+            .begin()
+            .map_err(|e| raft::Error::Store(raft::StorageError::Other(e.into())))?;
+
+        let res = store
+            .get_entries(low, high, max_size, &mut tx)
+            .map_err(|e| raft::Error::Store(raft::StorageError::Other(e.into())));
+
+        tx.prepare()
+            .map_err(|e| raft::Error::Store(raft::StorageError::Other(e.into())))?
+            .commit()
+            .map_err(|e| raft::Error::Store(raft::StorageError::Other(e.into())))?;
+
+        res
     }
 
     fn term(&self, idx: u64) -> raft::Result<u64> {
-        todo!()
+        let store = self.rl();
+        let mut tx = store
+            .persy
+            .begin()
+            .map_err(|_| raft::Error::Store(raft::StorageError::Unavailable))?;
+
+        let first_index = store
+            .get_first_index(&mut tx)
+            .map_err(|_| raft::Error::Store(raft::StorageError::Unavailable))?;
+        let last_index = store
+            .get_last_index(&mut tx)
+            .map_err(|_| raft::Error::Store(raft::StorageError::Unavailable))?;
+        let hs = store
+            .get_hard_state(&mut tx)
+            .map_err(|_| raft::Error::Store(raft::StorageError::Unavailable))?;
+
+        let res = if idx == hs.commit {
+            Ok(hs.term)
+        } else if idx < first_index - 1 {
+            Err(raft::Error::Store(raft::StorageError::Compacted))
+        } else if idx > last_index {
+            Err(raft::Error::Store(raft::StorageError::Unavailable))
+        } else {
+            store
+                .get_entry(idx, &mut tx)
+                .map_err(|_| raft::Error::Store(raft::StorageError::Unavailable))
+                .map(|e| e.term)
+        };
+
+        tx.prepare()
+            .map_err(|e| raft::Error::Store(raft::StorageError::Other(e.into())))?
+            .commit()
+            .map_err(|e| raft::Error::Store(raft::StorageError::Other(e.into())))?;
+
+        res
     }
 
     fn first_index(&self) -> raft::Result<u64> {
-        todo!()
+        let store = self.rl();
+        let mut tx = store
+            .persy
+            .begin()
+            .map_err(|_| raft::Error::Store(raft::StorageError::Unavailable))?;
+
+        let first_index = store
+            .get_first_index(&mut tx)
+            .map_err(|_| raft::Error::Store(raft::StorageError::Unavailable));
+
+        tx.prepare()
+            .map_err(|e| raft::Error::Store(raft::StorageError::Other(e.into())))?
+            .commit()
+            .map_err(|e| raft::Error::Store(raft::StorageError::Other(e.into())))?;
+
+        first_index
     }
 
     fn last_index(&self) -> raft::Result<u64> {
-        todo!()
+        let store = self.rl();
+        let mut tx = store
+            .persy
+            .begin()
+            .map_err(|_| raft::Error::Store(raft::StorageError::Unavailable))?;
+
+        let last_index = store
+            .get_last_index(&mut tx)
+            .map_err(|_| raft::Error::Store(raft::StorageError::Unavailable));
+
+        tx.prepare()
+            .map_err(|e| raft::Error::Store(raft::StorageError::Other(e.into())))?
+            .commit()
+            .map_err(|e| raft::Error::Store(raft::StorageError::Other(e.into())))?;
+
+        last_index
     }
 
     fn snapshot(&self, request_index: u64, to: u64) -> raft::Result<Snapshot> {
-        todo!()
+        let store = self.rl();
+        let mut tx = store
+            .persy
+            .begin()
+            .map_err(|_| raft::Error::Store(raft::StorageError::Unavailable))?;
+
+        let snap = store
+            .get_snapshot(&mut tx)
+            .map_err(|_| raft::Error::Store(raft::StorageError::Unavailable));
+
+        tx.prepare()
+            .map_err(|e| raft::Error::Store(raft::StorageError::Other(e.into())))?
+            .commit()
+            .map_err(|e| raft::Error::Store(raft::StorageError::Other(e.into())))?;
+
+        snap
     }
 }
 
@@ -267,4 +366,88 @@ pub trait LogStore: Storage {
     fn create_snapshot(&mut self, data: Vec<u8>) -> Result<()>;
     fn apply_snapshot(&mut self, snapshot: Snapshot) -> Result<()>;
     fn compact(&mut self, index: u64) -> Result<()>;
+}
+
+impl LogStore for NodeStorage {
+    fn append(&mut self, entries: &[Entry]) -> Result<()> {
+        let store = self.wl();
+        let mut tx = store.persy.begin()?;
+
+        store.append_entries(&mut tx, entries)?;
+
+        tx.prepare()?.commit()?;
+        Ok(())
+    }
+
+    fn set_hard_state(&mut self, hard_state: &HardState) -> Result<()> {
+        let store = self.wl();
+        let mut tx = store.persy.begin()?;
+
+        store.set_hard_state(&mut tx, hard_state)?;
+
+        tx.prepare()?.commit()?;
+        Ok(())
+    }
+
+    fn set_conf_state(&mut self, conf_state: &ConfState) -> Result<()> {
+        let store = self.wl();
+        let mut tx = store.persy.begin()?;
+
+        store.set_conf_state(&mut tx, conf_state)?;
+
+        tx.prepare()?.commit()?;
+        Ok(())
+    }
+
+    fn create_snapshot(&mut self, data: Vec<u8>) -> Result<()> {
+        let store = self.wl();
+        let mut tx = store.persy.begin()?;
+
+        let hard_state = store.get_hard_state(&mut tx)?;
+        let conf_state = store.get_conf_state(&mut tx)?;
+
+        let mut snapshot = Snapshot::default();
+        snapshot.set_data(data.into());
+
+        let metadata = snapshot.mut_metadata();
+        metadata.set_conf_state(conf_state);
+        metadata.set_index(hard_state.commit);
+        metadata.set_term(hard_state.term);
+
+        store.set_snapshot(&mut tx, &snapshot)?;
+
+        tx.prepare()?.commit()?;
+        Ok(())
+    }
+
+    fn apply_snapshot(&mut self, snapshot: Snapshot) -> Result<()> {
+        let store = self.wl();
+        let mut tx = store.persy.begin()?;
+
+        let metadata = snapshot.get_metadata();
+        let conf_state = metadata.get_conf_state();
+        let mut hard_state = store.get_hard_state(&mut tx)?;
+
+        hard_state.set_term(metadata.term);
+        hard_state.set_commit(metadata.index);
+
+        store.set_hard_state(&mut tx, &hard_state)?;
+        store.set_conf_state(&mut tx, &conf_state)?;
+        store.set_last_index(&mut tx, metadata.index)?;
+
+        tx.prepare()?.commit()?;
+        Ok(())
+    }
+
+    fn compact(&mut self, index: u64) -> Result<()> {
+        let store = self.wl();
+        let mut tx = store.persy.begin()?;
+
+        let last_index = store.get_last_index(&mut tx)?;
+        assert!(last_index > index + 1);
+        for i in 0..index {
+            tx.remove::<u64, ByteVec>(ENTRIES_INDEX, i, None)?;
+        }
+        Ok(())
+    }
 }
