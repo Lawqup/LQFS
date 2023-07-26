@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{cmp::Ordering, sync::Arc};
 
 use crate::prelude::*;
 
@@ -15,7 +15,7 @@ pub struct NodeStorageCore {
 const ENTRIES_INDEX: &str = "snapshot";
 const METADATA_INDEX: &str = "metadata";
 
-const SNAPSHOT_KEY: &str = "snapshot";
+const SNAPSHOT_METADATA_KEY: &str = "snapshot";
 const LAST_INDEX_KEY: &str = "last_index";
 const HARD_STATE_KEY: &str = "hard_state";
 const CONF_STATE_KEY: &str = "conf_state";
@@ -36,6 +36,7 @@ impl NodeStorageCore {
 
         store.set_hard_state(&mut tx, &HardState::default())?;
         store.set_conf_state(&mut tx, &ConfState::default())?;
+        store.set_snapshot_metadata(&mut tx, &SnapshotMetadata::default())?;
 
         tx.prepare()?.commit()?;
 
@@ -64,11 +65,15 @@ impl NodeStorageCore {
         Ok(())
     }
 
-    pub fn set_snapshot(&self, tx: &mut Transaction, snapshot: &Snapshot) -> Result<()> {
+    pub fn set_snapshot_metadata(
+        &self,
+        tx: &mut Transaction,
+        metadata: &SnapshotMetadata,
+    ) -> Result<()> {
         tx.put::<String, ByteVec>(
             METADATA_INDEX,
-            SNAPSHOT_KEY.to_string(),
-            snapshot.write_to_bytes()?.into(),
+            SNAPSHOT_METADATA_KEY.to_string(),
+            metadata.write_to_bytes()?.into(),
         )?;
 
         Ok(())
@@ -115,9 +120,34 @@ impl NodeStorageCore {
         Ok(ConfState::parse_from_bytes(data)?)
     }
 
-    pub fn get_snapshot(&self, tx: &mut Transaction) -> Result<Snapshot> {
+    pub fn get_snapshot_metadata(&self, tx: &mut Transaction) -> Result<SnapshotMetadata> {
         let data = &tx
-            .get::<String, ByteVec>(METADATA_INDEX, &SNAPSHOT_KEY.into())?
+            .get::<String, ByteVec>(METADATA_INDEX, &SNAPSHOT_METADATA_KEY.into())?
+            .nth(0)
+            .unwrap();
+
+        Ok(SnapshotMetadata::parse_from_bytes(data)?)
+    }
+
+    pub fn get_snapshot(&self, tx: &mut Transaction) -> Result<Snapshot> {
+        let mut snapshot = Snapshot::default();
+
+        let meta = snapshot.mut_metadata();
+        let self_meta = self.get_snapshot_metadata(tx)?;
+        meta.index = self.get_hard_state(tx)?.commit;
+        meta.term = match meta.index.cmp(&self_meta.index) {
+            Ordering::Less => {
+                panic!(
+                    "commit {} < snapshot metadata index {}",
+                    meta.index, self_meta.index
+                )
+            }
+            Ordering::Equal => self_meta.term,
+            Ordering::Greater => self.get_entry(meta.index, tx)?.term,
+        };
+
+        let data = &tx
+            .get::<String, ByteVec>(METADATA_INDEX, &SNAPSHOT_METADATA_KEY.into())?
             .nth(0)
             .unwrap();
 
@@ -132,7 +162,7 @@ impl NodeStorageCore {
                 data[..].try_into().map_err(|_| Error::ConverstionError)?,
             ))
         } else {
-            Ok(0)
+            Ok(self.get_snapshot_metadata(tx)?.index)
         }
     }
 
@@ -145,7 +175,7 @@ impl NodeStorageCore {
 
             Ok(e.index)
         } else {
-            Ok(1)
+            Ok(self.get_snapshot_metadata(tx)?.index + 1)
         }
     }
 
@@ -418,7 +448,7 @@ impl LogStore for NodeStorage {
         metadata.set_index(hard_state.commit);
         metadata.set_term(hard_state.term);
 
-        store.set_snapshot(&mut tx, &snapshot)?;
+        store.set_snapshot_metadata(&mut tx, &metadata)?;
 
         tx.prepare()?.commit()?;
         Ok(())
@@ -448,6 +478,7 @@ impl LogStore for NodeStorage {
         store.set_hard_state(&mut tx, &hard_state)?;
         store.set_conf_state(&mut tx, &conf_state)?;
         store.set_last_index(&mut tx, metadata.index)?;
+        store.set_snapshot_metadata(&mut tx, metadata)?;
 
         tx.prepare()?.commit()?;
         Ok(())
