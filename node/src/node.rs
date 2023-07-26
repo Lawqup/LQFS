@@ -1,5 +1,5 @@
 //! Defines the node struct and provides its APIs
-use raft::{prelude::*, storage::MemStorage, Config, RawNode, StateRole};
+use raft::{prelude::*, Config, RawNode, StateRole};
 
 use protobuf::Message as PbMessage;
 use std::{
@@ -11,10 +11,11 @@ use std::{
 use crate::{
     network::{Network, QueryMsg, RequestMsg, Response, ResponseMsg, Signal},
     prelude::*,
+    storage::{LogStore, NodeStorage},
 };
 
 pub struct Node {
-    raft: Option<RawNode<MemStorage>>,
+    raft: Option<RawNode<NodeStorage>>,
     network: Network,
     id: u64,
     followers_to_add: VecDeque<u64>,
@@ -52,13 +53,14 @@ impl Node {
         config.validate().expect("Raft config should be valid");
 
         let logger = logger.new(o!("tag" => format!("node_{id}")));
+
         let mut s = Snapshot::default();
         s.mut_metadata().index = 1;
         s.mut_metadata().term = 1;
         s.mut_metadata().mut_conf_state().voters = vec![id];
 
-        let storage = MemStorage::new();
-        storage.wl().apply_snapshot(s).unwrap();
+        let storage = NodeStorage::create(id).expect("Could not create Node Storage");
+        storage.apply_snapshot(s).unwrap();
 
         let mut raft = Some(RawNode::new(&config, storage, &logger).unwrap());
 
@@ -70,7 +72,8 @@ impl Node {
             }
         }
 
-        raft.as_mut().unwrap().campaign().unwrap();
+        raft.as_mut().unwrap().raft.become_candidate();
+        raft.as_mut().unwrap().raft.become_leader();
         Self {
             raft,
             network,
@@ -101,8 +104,8 @@ impl Node {
 
         let mut config = Self::config();
         config.id = msg.to;
-        let storage = MemStorage::new();
-        self.raft = Some(RawNode::new(&config, storage, &self.logger).unwrap());
+        let storage = NodeStorage::create(self.id)?;
+        self.raft = Some(RawNode::new(&config, storage, &self.logger)?);
         return Ok(());
     }
 
@@ -127,6 +130,7 @@ impl Node {
                 let network = network_clone.lock().unwrap();
                 match network.get_node_rx(self.id).try_recv() {
                     Ok(RequestMsg::Raft(m)) => {
+                        info!(self.logger, "Recieved raft message {m:?}");
                         self.step(m);
                     }
                     Ok(RequestMsg::Propose(p)) => {
@@ -163,7 +167,6 @@ impl Node {
             let elapsed = now.elapsed();
             if elapsed >= Self::TICK_COOLDOWN {
                 now = Instant::now();
-                info!(self.logger, "tick",);
                 raft.tick();
 
                 if let Some(follower) = self.followers_to_add.get(0) {
@@ -224,6 +227,20 @@ impl Node {
         let mut ready = raft.ready();
         let store = raft.store().clone();
 
+        debug!(self.logger, "READY: {ready:?}");
+
+        if !ready.entries().is_empty() {
+            store.append(ready.entries()).unwrap();
+        }
+
+        if let Some(hs) = ready.hs() {
+            // Raft HardState changed, and we need to persist it.
+            store
+                .set_hard_state(hs)
+                .expect("Could not update hard state");
+            debug!(self.logger, "HARDSTATE: {:?}", store.get_hard_state());
+        }
+
         if !ready.messages().is_empty() {
             self.network
                 .lock()
@@ -233,25 +250,10 @@ impl Node {
 
         if !ready.snapshot().is_empty() {
             let s = ready.snapshot().clone();
-            if let Err(e) = store.wl().apply_snapshot(s) {
-                error!(
-                    self.logger,
-                    "Apply snapshot failed: {:?}, need to retry or panic", e
-                );
-                return;
-            }
+            store.apply_snapshot(s).expect("Could not apply snapshot");
         }
 
         self.handle_commited_entries(ready.take_committed_entries());
-
-        if !ready.entries().is_empty() {
-            store.wl().append(ready.entries()).unwrap();
-        }
-
-        if let Some(hs) = ready.hs() {
-            // Raft HardState changed, and we need to persist it.
-            store.wl().set_hardstate(hs.clone());
-        }
 
         if !ready.persisted_messages().is_empty() {
             self.network
@@ -263,7 +265,11 @@ impl Node {
         let mut light_rd = self.raft_mut().advance(ready);
 
         if let Some(commit) = light_rd.commit_index() {
-            store.wl().mut_hard_state().set_commit(commit);
+            let mut hs = store.get_hard_state().unwrap();
+            hs.set_commit(commit);
+            store
+                .set_hard_state(&hs)
+                .expect("Could not update hard state");
         }
 
         self.network
@@ -276,11 +282,11 @@ impl Node {
         self.raft_mut().advance_apply();
     }
 
-    fn raft_mut(&mut self) -> &mut RawNode<MemStorage> {
+    fn raft_mut(&mut self) -> &mut RawNode<NodeStorage> {
         self.raft.as_mut().unwrap()
     }
 
-    fn raft(&self) -> &RawNode<MemStorage> {
+    fn raft(&self) -> &RawNode<NodeStorage> {
         self.raft.as_ref().unwrap()
     }
 
@@ -306,7 +312,10 @@ impl Node {
                     let mut cc = ConfChange::default();
                     cc.merge_from_bytes(&entry.data).unwrap();
                     let cs = self.raft_mut().apply_conf_change(&cc).unwrap();
-                    self.raft_mut().store().wl().set_conf_state(cs);
+                    self.raft_mut()
+                        .store()
+                        .set_conf_state(&cs)
+                        .expect("Could not update conf state");
                 }
                 EntryType::EntryConfChangeV2 => todo!(),
             }
@@ -334,6 +343,7 @@ impl Node {
 mod test {
     use std::{
         collections::{HashMap, HashSet},
+        env, fs,
         sync::{mpsc::Receiver, Arc, Mutex},
         thread::{self, JoinHandle},
         time::Duration,
@@ -350,6 +360,16 @@ mod test {
     };
 
     use super::Node;
+
+    macro_rules! in_temp_dir {
+        ($block:block) => {
+            let tmpdir = tempfile::tempdir().unwrap();
+            env::set_current_dir(&tmpdir).unwrap();
+            fs::create_dir("store").unwrap();
+
+            $block;
+        };
+    }
 
     const CLIENT_TIMEOUT: Duration = Duration::from_millis(5000);
 
@@ -493,40 +513,42 @@ mod test {
     #[test_case(1)]
     #[test_case(3)]
     #[test_case(9)]
-    #[timeout(4000)]
+    #[timeout(2000)]
     fn leader_election(n_peers: u64) {
-        let peers: Vec<u64> = (1..=n_peers).collect();
-        let logger = build_debug_logger();
+        in_temp_dir!({
+            let peers: Vec<u64> = (1..=n_peers).collect();
+            let logger = build_debug_logger();
 
-        let InitResult {
-            network,
-            node_handles,
-            ..
-        } = init_cluster(&peers, &[], &logger);
+            let InitResult {
+                network,
+                node_handles,
+                ..
+            } = init_cluster(&peers, &[], &logger);
 
-        for id in peers.clone() {
-            network
-                .lock()
-                .unwrap()
-                .send_control_message(id, Signal::Shutdown);
-        }
-
-        let mut n_leaders = 0;
-        let mut n_followers = 0;
-        for handle in node_handles {
-            let node = handle.join().expect("Handle could not be joined");
-
-            assert!(node.raft.is_some());
-
-            match node.raft().raft.state {
-                StateRole::Leader => n_leaders += 1,
-                StateRole::Follower => n_followers += 1,
-                _ => (),
+            for id in peers.clone() {
+                network
+                    .lock()
+                    .unwrap()
+                    .send_control_message(id, Signal::Shutdown);
             }
-        }
 
-        assert_eq!(1, n_leaders);
-        assert_eq!(peers.len() - 1, n_followers);
+            let mut n_leaders = 0;
+            let mut n_followers = 0;
+            for handle in node_handles {
+                let node = handle.join().expect("Handle could not be joined");
+
+                assert!(node.raft.is_some());
+
+                match node.raft().raft.state {
+                    StateRole::Leader => n_leaders += 1,
+                    StateRole::Follower => n_followers += 1,
+                    _ => (),
+                }
+            }
+
+            assert_eq!(1, n_leaders);
+            assert_eq!(peers.len() - 1, n_followers);
+        });
     }
 
     #[test_case(1, 1, name = "single_node_1_client_simple")]
@@ -534,88 +556,92 @@ mod test {
     #[test_case(5, 5, name = "multi_node_5_client_simple")]
     #[timeout(2000)]
     fn simple(n_peers: u64, n_clients: u64) {
-        let peers: Vec<u64> = (1..=n_peers).collect();
-        let clients: Vec<u64> = (1..=n_clients).collect();
-        let logger = build_debug_logger();
+        in_temp_dir!({
+            let peers: Vec<u64> = (1..=n_peers).collect();
+            let clients: Vec<u64> = (1..=n_clients).collect();
+            let logger = build_debug_logger();
 
-        let InitResult {
-            network,
-            node_handles,
-            mut client_rxs,
-            ..
-        } = init_cluster(&peers, &clients, &logger);
+            let InitResult {
+                network,
+                node_handles,
+                mut client_rxs,
+                ..
+            } = init_cluster(&peers, &clients, &logger);
 
-        let mut client_handles = Vec::new();
-        for client_id in clients {
-            client_handles.push(spawn_client(
-                client_id,
-                1,
-                Mutex::new(client_rxs.remove(&client_id).unwrap()),
-                logger.clone(),
-                network.clone(),
-            ));
-        }
+            let mut client_handles = Vec::new();
+            for client_id in clients {
+                client_handles.push(spawn_client(
+                    client_id,
+                    1,
+                    Mutex::new(client_rxs.remove(&client_id).unwrap()),
+                    logger.clone(),
+                    network.clone(),
+                ));
+            }
 
-        for handle in client_handles {
-            handle.join().expect("Handle could not be joined");
-        }
+            for handle in client_handles {
+                handle.join().expect("Handle could not be joined");
+            }
 
-        for id in peers {
-            network
-                .lock()
-                .unwrap()
-                .send_control_message(id, Signal::Shutdown);
-        }
+            for id in peers {
+                network
+                    .lock()
+                    .unwrap()
+                    .send_control_message(id, Signal::Shutdown);
+            }
 
-        for handle in node_handles {
-            handle.join().expect("Handle could not be joined");
-        }
+            for handle in node_handles {
+                handle.join().expect("Handle could not be joined");
+            }
+        });
     }
 
     #[test_case(3, 5, name = "three_node_5_client_node_failure")]
     #[test_case(9, 5, name = "nine_node_5_client_node_failure")]
     #[timeout(6000)]
     fn node_failure(n_peers: u64, n_clients: u64) {
-        let peers: Vec<u64> = (1..=n_peers).collect();
-        let clients: Vec<u64> = (1..=n_clients).collect();
-        let logger = build_debug_logger();
+        in_temp_dir!({
+            let peers: Vec<u64> = (1..=n_peers).collect();
+            let clients: Vec<u64> = (1..=n_clients).collect();
+            let logger = build_debug_logger();
 
-        let InitResult {
-            network,
-            node_handles,
-            mut client_rxs,
-            ..
-        } = init_cluster(&peers, &clients, &logger);
+            let InitResult {
+                network,
+                node_handles,
+                mut client_rxs,
+                ..
+            } = init_cluster(&peers, &clients, &logger);
 
-        let mut client_handles = Vec::new();
-        for client_id in clients {
-            client_handles.push(spawn_client(
-                client_id,
-                1,
-                Mutex::new(client_rxs.remove(&client_id).unwrap()),
-                logger.clone(),
-                network.clone(),
-            ));
-        }
+            let mut client_handles = Vec::new();
+            for client_id in clients {
+                client_handles.push(spawn_client(
+                    client_id,
+                    1,
+                    Mutex::new(client_rxs.remove(&client_id).unwrap()),
+                    logger.clone(),
+                    network.clone(),
+                ));
+            }
 
-        network
-            .lock()
-            .unwrap()
-            .send_control_message(1, Signal::Shutdown);
-
-        for handle in client_handles {
-            handle.join().expect("Handle could not be joined");
-        }
-
-        for id in peers {
             network
                 .lock()
                 .unwrap()
-                .send_control_message(id, Signal::Shutdown);
-        }
+                .send_control_message(1, Signal::Shutdown);
 
-        for handle in node_handles {
-            handle.join().expect("Handle could not be joined");
-        }
+            for handle in client_handles {
+                handle.join().expect("Handle could not be joined");
+            }
+
+            for id in peers {
+                network
+                    .lock()
+                    .unwrap()
+                    .send_control_message(id, Signal::Shutdown);
+            }
+
+            for handle in node_handles {
+                handle.join().expect("Handle could not be joined");
+            }
+        });
     }
 }

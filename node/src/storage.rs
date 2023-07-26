@@ -1,16 +1,10 @@
-use std::{
-    borrow::Cow,
-    fs,
-    path::Path,
-    sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard},
-};
+use std::sync::Arc;
 
 use crate::prelude::*;
 
-use persy::{ByteVec, IndexType, Persy, Transaction, TxIndexIter, ValueMode};
+use persy::{ByteVec, Persy, Transaction, TxIndexIter, ValueMode};
 use protobuf::Message;
 use raft::{prelude::*, Storage};
-use slog::warn;
 
 use crate::prelude::Result;
 
@@ -30,6 +24,7 @@ impl NodeStorageCore {
     pub fn create(id: u64) -> Result<Self> {
         let path = format!("store/raft-{id}.mdb");
 
+        println!("CREATING {path}");
         Persy::create(&path)?;
         let persy: Persy = Persy::open(path, persy::Config::new())?;
         let mut tx = persy.begin()?;
@@ -39,15 +34,17 @@ impl NodeStorageCore {
         tx.create_index::<u64, ByteVec>(ENTRIES_INDEX, ValueMode::Exclusive)?;
         tx.create_index::<String, ByteVec>(METADATA_INDEX, ValueMode::Replace)?;
 
-        store.set_hard_state(&mut tx, &HardState::new())?;
-        store.set_conf_state(&mut tx, &ConfState::new())?;
+        store.set_hard_state(&mut tx, &HardState::default())?;
+        store.set_conf_state(&mut tx, &ConfState::default())?;
         store.append_entries(&mut tx, &[Entry::default()])?;
 
         tx.prepare()?.commit()?;
+
         Ok(store)
     }
 
     pub fn set_hard_state(&self, tx: &mut Transaction, hard_state: &HardState) -> Result<()> {
+        println!("SETTING HARDSTATE: {:?}", hard_state);
         tx.put::<String, ByteVec>(
             METADATA_INDEX,
             HARD_STATE_KEY.to_string(),
@@ -58,6 +55,7 @@ impl NodeStorageCore {
     }
 
     pub fn set_conf_state(&self, tx: &mut Transaction, conf_state: &ConfState) -> Result<()> {
+        println!("SETTING CONFSTATE: {:?}", conf_state);
         tx.put::<String, ByteVec>(
             METADATA_INDEX,
             CONF_STATE_KEY.to_string(),
@@ -90,11 +88,10 @@ impl NodeStorageCore {
     pub fn append_entries(&self, tx: &mut Transaction, entries: &[Entry]) -> Result<()> {
         let mut last_index = self.get_last_index(tx)?;
 
-        let mut entries = entries.to_vec();
-        entries.sort_unstable_by_key(|a| a.index);
-
+        println!("APPENDING ENTRIES");
         for entry in entries {
             let index = entry.index;
+            println!("APPENDING ENTRY to index {}", index);
             last_index = std::cmp::max(last_index, index);
             tx.put::<u64, ByteVec>(ENTRIES_INDEX, index, entry.write_to_bytes()?.into())?;
         }
@@ -107,10 +104,7 @@ impl NodeStorageCore {
             .nth(0)
             .unwrap();
 
-        let mut hs = HardState::default();
-        hs.merge_from_bytes(data)?;
-
-        Ok(hs)
+        Ok(HardState::parse_from_bytes(data)?)
     }
 
     pub fn get_conf_state(&self, tx: &mut Transaction) -> Result<ConfState> {
@@ -119,10 +113,7 @@ impl NodeStorageCore {
             .nth(0)
             .unwrap();
 
-        let mut cs = ConfState::default();
-        cs.merge_from_bytes(data)?;
-
-        Ok(cs)
+        Ok(ConfState::parse_from_bytes(data)?)
     }
 
     pub fn get_snapshot(&self, tx: &mut Transaction) -> Result<Snapshot> {
@@ -131,24 +122,19 @@ impl NodeStorageCore {
             .nth(0)
             .unwrap();
 
-        let mut snap = Snapshot::default();
-        snap.merge_from_bytes(data)?;
-
-        Ok(snap)
+        Ok(Snapshot::parse_from_bytes(data)?)
     }
 
     pub fn get_last_index(&self, tx: &mut Transaction) -> Result<u64> {
-        let data = tx.get::<String, ByteVec>(METADATA_INDEX, &LAST_INDEX_KEY.into());
+        let mut data = tx.get::<String, ByteVec>(METADATA_INDEX, &LAST_INDEX_KEY.into())?;
 
-        if data.is_err() {
-            return Ok(0);
+        if let Some(data) = data.nth(0) {
+            Ok(u64::from_le_bytes(
+                data[..].try_into().map_err(|_| Error::ConverstionError)?,
+            ))
+        } else {
+            Ok(0)
         }
-
-        let data = data.unwrap().nth(0).unwrap();
-
-        Ok(u64::from_le_bytes(
-            data[..].try_into().map_err(|_| Error::ConverstionError)?,
-        ))
     }
 
     pub fn get_first_index(&self, tx: &mut Transaction) -> Result<u64> {
@@ -189,33 +175,23 @@ impl NodeStorageCore {
             .nth(0)
             .unwrap();
 
-        let mut entry = Entry::default();
-        entry.merge_from_bytes(&data)?;
-
-        Ok(entry)
+        Ok(Entry::parse_from_bytes(&data)?)
     }
 }
 
-struct NodeStorage(Arc<RwLock<NodeStorageCore>>);
+#[derive(Clone)]
+pub struct NodeStorage(Arc<NodeStorageCore>);
 
 impl NodeStorage {
     pub fn create(id: u64) -> Result<Self> {
         let core = NodeStorageCore::create(id)?;
-        Ok(Self(Arc::new(RwLock::new(core))))
-    }
-
-    pub fn wl(&mut self) -> RwLockWriteGuard<NodeStorageCore> {
-        self.0.write().unwrap()
-    }
-
-    pub fn rl(&self) -> RwLockReadGuard<NodeStorageCore> {
-        self.0.read().unwrap()
+        Ok(Self(Arc::new(core)))
     }
 }
 
 impl Storage for NodeStorage {
     fn initial_state(&self) -> raft::Result<RaftState> {
-        let store = self.rl();
+        let store = &self.0;
         let mut tx = store
             .persy
             .begin()
@@ -245,7 +221,7 @@ impl Storage for NodeStorage {
         max_size: impl Into<Option<u64>>,
         _context: raft::GetEntriesContext,
     ) -> raft::Result<Vec<Entry>> {
-        let store = self.rl();
+        let store = &self.0;
         let mut tx = store
             .persy
             .begin()
@@ -264,7 +240,7 @@ impl Storage for NodeStorage {
     }
 
     fn term(&self, idx: u64) -> raft::Result<u64> {
-        let store = self.rl();
+        let store = &self.0;
         let mut tx = store
             .persy
             .begin()
@@ -302,7 +278,7 @@ impl Storage for NodeStorage {
     }
 
     fn first_index(&self) -> raft::Result<u64> {
-        let store = self.rl();
+        let store = &self.0;
         let mut tx = store
             .persy
             .begin()
@@ -321,7 +297,7 @@ impl Storage for NodeStorage {
     }
 
     fn last_index(&self) -> raft::Result<u64> {
-        let store = self.rl();
+        let store = &self.0;
         let mut tx = store
             .persy
             .begin()
@@ -339,8 +315,8 @@ impl Storage for NodeStorage {
         last_index
     }
 
-    fn snapshot(&self, request_index: u64, to: u64) -> raft::Result<Snapshot> {
-        let store = self.rl();
+    fn snapshot(&self, _request_index: u64, _to: u64) -> raft::Result<Snapshot> {
+        let store = &self.0;
         let mut tx = store
             .persy
             .begin()
@@ -348,7 +324,7 @@ impl Storage for NodeStorage {
 
         let snap = store
             .get_snapshot(&mut tx)
-            .map_err(|_| raft::Error::Store(raft::StorageError::Unavailable));
+            .map_err(|_| raft::Error::Store(raft::StorageError::SnapshotTemporarilyUnavailable));
 
         tx.prepare()
             .map_err(|e| raft::Error::Store(raft::StorageError::Other(e.into())))?
@@ -360,17 +336,18 @@ impl Storage for NodeStorage {
 }
 
 pub trait LogStore: Storage {
-    fn append(&mut self, entries: &[Entry]) -> Result<()>;
-    fn set_hard_state(&mut self, hard_state: &HardState) -> Result<()>;
-    fn set_conf_state(&mut self, conf_state: &ConfState) -> Result<()>;
-    fn create_snapshot(&mut self, data: Vec<u8>) -> Result<()>;
-    fn apply_snapshot(&mut self, snapshot: Snapshot) -> Result<()>;
-    fn compact(&mut self, index: u64) -> Result<()>;
+    fn append(&self, entries: &[Entry]) -> Result<()>;
+    fn set_hard_state(&self, hard_state: &HardState) -> Result<()>;
+    fn get_hard_state(&self) -> Result<HardState>;
+    fn set_conf_state(&self, conf_state: &ConfState) -> Result<()>;
+    fn create_snapshot(&self, data: Vec<u8>) -> Result<()>;
+    fn apply_snapshot(&self, snapshot: Snapshot) -> Result<()>;
+    fn compact(&self, index: u64) -> Result<()>;
 }
 
 impl LogStore for NodeStorage {
-    fn append(&mut self, entries: &[Entry]) -> Result<()> {
-        let store = self.wl();
+    fn append(&self, entries: &[Entry]) -> Result<()> {
+        let store = &self.0;
         let mut tx = store.persy.begin()?;
 
         store.append_entries(&mut tx, entries)?;
@@ -379,8 +356,8 @@ impl LogStore for NodeStorage {
         Ok(())
     }
 
-    fn set_hard_state(&mut self, hard_state: &HardState) -> Result<()> {
-        let store = self.wl();
+    fn set_hard_state(&self, hard_state: &HardState) -> Result<()> {
+        let store = &self.0;
         let mut tx = store.persy.begin()?;
 
         store.set_hard_state(&mut tx, hard_state)?;
@@ -389,8 +366,8 @@ impl LogStore for NodeStorage {
         Ok(())
     }
 
-    fn set_conf_state(&mut self, conf_state: &ConfState) -> Result<()> {
-        let store = self.wl();
+    fn set_conf_state(&self, conf_state: &ConfState) -> Result<()> {
+        let store = &self.0;
         let mut tx = store.persy.begin()?;
 
         store.set_conf_state(&mut tx, conf_state)?;
@@ -399,8 +376,8 @@ impl LogStore for NodeStorage {
         Ok(())
     }
 
-    fn create_snapshot(&mut self, data: Vec<u8>) -> Result<()> {
-        let store = self.wl();
+    fn create_snapshot(&self, data: Vec<u8>) -> Result<()> {
+        let store = &self.0;
         let mut tx = store.persy.begin()?;
 
         let hard_state = store.get_hard_state(&mut tx)?;
@@ -420,8 +397,8 @@ impl LogStore for NodeStorage {
         Ok(())
     }
 
-    fn apply_snapshot(&mut self, snapshot: Snapshot) -> Result<()> {
-        let store = self.wl();
+    fn apply_snapshot(&self, snapshot: Snapshot) -> Result<()> {
+        let store = &self.0;
         let mut tx = store.persy.begin()?;
 
         let metadata = snapshot.get_metadata();
@@ -439,8 +416,8 @@ impl LogStore for NodeStorage {
         Ok(())
     }
 
-    fn compact(&mut self, index: u64) -> Result<()> {
-        let store = self.wl();
+    fn compact(&self, index: u64) -> Result<()> {
+        let store = &self.0;
         let mut tx = store.persy.begin()?;
 
         let last_index = store.get_last_index(&mut tx)?;
@@ -448,6 +425,18 @@ impl LogStore for NodeStorage {
         for i in 0..index {
             tx.remove::<u64, ByteVec>(ENTRIES_INDEX, i, None)?;
         }
+
+        tx.prepare()?.commit()?;
         Ok(())
+    }
+
+    fn get_hard_state(&self) -> Result<HardState> {
+        let store = &self.0;
+        let mut tx = store.persy.begin()?;
+
+        let hard_state = store.get_hard_state(&mut tx)?;
+
+        tx.prepare()?.commit()?;
+        Ok(hard_state)
     }
 }
