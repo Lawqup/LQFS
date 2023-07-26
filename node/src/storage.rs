@@ -16,7 +16,6 @@ const ENTRIES_INDEX: &str = "snapshot";
 const METADATA_INDEX: &str = "metadata";
 
 const SNAPSHOT_KEY: &str = "snapshot";
-const LAST_INDEX_KEY: &str = "last_index";
 const HARD_STATE_KEY: &str = "hard_state";
 const CONF_STATE_KEY: &str = "conf_state";
 
@@ -36,7 +35,6 @@ impl NodeStorageCore {
 
         store.set_hard_state(&mut tx, &HardState::default())?;
         store.set_conf_state(&mut tx, &ConfState::default())?;
-        store.append_entries(&mut tx, &[Entry::default()])?;
 
         tx.prepare()?.commit()?;
 
@@ -95,7 +93,7 @@ impl NodeStorageCore {
             last_index = std::cmp::max(last_index, index);
             tx.put::<u64, ByteVec>(ENTRIES_INDEX, index, entry.write_to_bytes()?.into())?;
         }
-        Ok(())
+        self.set_last_index(tx, last_index)
     }
 
     pub fn get_hard_state(&self, tx: &mut Transaction) -> Result<HardState> {
@@ -138,7 +136,16 @@ impl NodeStorageCore {
     }
 
     pub fn get_first_index(&self, tx: &mut Transaction) -> Result<u64> {
-        Ok(self.get_entry(0, tx)?.index + 1)
+        let mut iter: TxIndexIter<u64, ByteVec> = tx.range(ENTRIES_INDEX, ..)?;
+
+        if let Some(mut e) = iter.nth(0) {
+            let e = Entry::parse_from_bytes(&e.1.nth(0).unwrap())
+                .expect("Entry bytes should not be malformed.");
+
+            Ok(e.index)
+        } else {
+            Ok(1)
+        }
     }
 
     pub fn get_entries(
@@ -173,9 +180,26 @@ impl NodeStorageCore {
         let data = tx
             .get::<u64, ByteVec>(ENTRIES_INDEX, &index)?
             .nth(0)
-            .unwrap();
+            .ok_or(raft::Error::Store(raft::StorageError::Unavailable))?;
 
         Ok(Entry::parse_from_bytes(&data)?)
+    }
+
+    #[cfg(test)]
+    fn set_entries(&self, entries: &[Entry]) -> Result<()> {
+        let mut tx = self.persy.begin()?;
+        tx.drop_index(ENTRIES_INDEX)?;
+        tx.create_index::<u64, ByteVec>(ENTRIES_INDEX, ValueMode::Exclusive)?;
+
+        let mut to_add = [Entry::default()].to_vec();
+        to_add.append(&mut entries.to_vec());
+
+        self.append_entries(&mut tx, &to_add)?;
+
+        // self.append_entries(&mut tx, entries)?;
+
+        tx.prepare()?.commit()?;
+        Ok(())
     }
 }
 
@@ -255,6 +279,8 @@ impl Storage for NodeStorage {
         let hs = store
             .get_hard_state(&mut tx)
             .map_err(|_| raft::Error::Store(raft::StorageError::Unavailable))?;
+
+        println!("GOT STUFF first: {first_index} last: {last_index} hs: {hs:?}");
 
         let res = if idx == hs.commit {
             Ok(hs.term)
@@ -421,7 +447,8 @@ impl LogStore for NodeStorage {
         let mut tx = store.persy.begin()?;
 
         let last_index = store.get_last_index(&mut tx)?;
-        assert!(last_index > index + 1);
+        assert!(last_index >= index);
+
         for i in 0..index {
             tx.remove::<u64, ByteVec>(ENTRIES_INDEX, i, None)?;
         }
@@ -438,5 +465,336 @@ impl LogStore for NodeStorage {
 
         tx.prepare()?.commit()?;
         Ok(hard_state)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use protobuf::Message as PbMessage;
+    use raft::prelude::*;
+    use raft::Error as RaftError;
+    use raft::GetEntriesContext;
+    use raft::StorageError;
+
+    use std::panic;
+    use std::panic::AssertUnwindSafe;
+    use std::{env, fs};
+
+    use super::LogStore;
+    use super::NodeStorage;
+
+    macro_rules! in_temp_dir {
+        ($block:block) => {
+            let tmpdir = tempfile::tempdir().unwrap();
+            env::set_current_dir(&tmpdir).unwrap();
+            fs::create_dir("store").unwrap();
+
+            $block;
+        };
+    }
+
+    fn new_entry(index: u64, term: u64) -> Entry {
+        let mut e = Entry::default();
+        e.term = term;
+        e.index = index;
+        e
+    }
+
+    fn size_of<T: PbMessage>(m: &T) -> u32 {
+        m.compute_size()
+    }
+
+    fn new_snapshot(index: u64, term: u64, voters: Vec<u64>) -> Snapshot {
+        let mut s = Snapshot::default();
+        s.mut_metadata().index = index;
+        s.mut_metadata().term = term;
+        s.mut_metadata().mut_conf_state().voters = voters;
+        s
+    }
+
+    #[test]
+    fn test_storage_term() {
+        let ents = vec![new_entry(3, 3), new_entry(4, 4), new_entry(5, 5)];
+        let mut tests = vec![
+            (2, Err(RaftError::Store(StorageError::Compacted))),
+            (3, Ok(3)),
+            (4, Ok(4)),
+            (5, Ok(5)),
+            (6, Err(RaftError::Store(StorageError::Unavailable))),
+        ];
+
+        for (i, (idx, wterm)) in tests.drain(..).enumerate() {
+            in_temp_dir!({
+                let storage = NodeStorage::create(1).unwrap();
+                storage.0.set_entries(&ents).unwrap();
+
+                let t = storage.term(idx);
+                if t != wterm {
+                    panic!("#{}: expect res {:?}, got {:?}", i, wterm, t);
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn test_storage_entries() {
+        let ents = vec![
+            new_entry(3, 3),
+            new_entry(4, 4),
+            new_entry(5, 5),
+            new_entry(6, 6),
+        ];
+        let max_u64 = u64::max_value();
+        let mut tests = vec![
+            (
+                2,
+                6,
+                max_u64,
+                Err(RaftError::Store(StorageError::Compacted)),
+            ),
+            (3, 4, max_u64, Ok(vec![new_entry(3, 3)])),
+            (4, 5, max_u64, Ok(vec![new_entry(4, 4)])),
+            (4, 6, max_u64, Ok(vec![new_entry(4, 4), new_entry(5, 5)])),
+            (
+                4,
+                7,
+                max_u64,
+                Ok(vec![new_entry(4, 4), new_entry(5, 5), new_entry(6, 6)]),
+            ),
+            // even if maxsize is zero, the first entry should be returned
+            (4, 7, 0, Ok(vec![new_entry(4, 4)])),
+            // limit to 2
+            (
+                4,
+                7,
+                u64::from(size_of(&ents[1]) + size_of(&ents[2])),
+                Ok(vec![new_entry(4, 4), new_entry(5, 5)]),
+            ),
+            (
+                4,
+                7,
+                u64::from(size_of(&ents[1]) + size_of(&ents[2]) + size_of(&ents[3]) / 2),
+                Ok(vec![new_entry(4, 4), new_entry(5, 5)]),
+            ),
+            (
+                4,
+                7,
+                u64::from(size_of(&ents[1]) + size_of(&ents[2]) + size_of(&ents[3]) - 1),
+                Ok(vec![new_entry(4, 4), new_entry(5, 5)]),
+            ),
+            // all
+            (
+                4,
+                7,
+                u64::from(size_of(&ents[1]) + size_of(&ents[2]) + size_of(&ents[3])),
+                Ok(vec![new_entry(4, 4), new_entry(5, 5), new_entry(6, 6)]),
+            ),
+        ];
+        for (i, (lo, hi, maxsize, wentries)) in tests.drain(..).enumerate() {
+            in_temp_dir!({
+                let storage = NodeStorage::create(1).unwrap();
+                storage.0.set_entries(&ents).unwrap();
+
+                let e = storage.entries(lo, hi, maxsize, GetEntriesContext::empty(false));
+                if e != wentries {
+                    panic!("#{}: expect entries {:?}, got {:?}", i, wentries, e);
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn test_storage_last_index() {
+        in_temp_dir!({
+            let ents = vec![new_entry(3, 3), new_entry(4, 4), new_entry(5, 5)];
+            let storage = NodeStorage::create(1).unwrap();
+            storage.0.set_entries(&ents);
+
+            let wresult = Ok(5);
+            let result = storage.last_index();
+            if result != wresult {
+                panic!("want {:?}, got {:?}", wresult, result);
+            }
+
+            storage.append(&[new_entry(6, 5)]).unwrap();
+            let wresult = Ok(6);
+            let result = storage.last_index();
+            if result != wresult {
+                panic!("want {:?}, got {:?}", wresult, result);
+            }
+        });
+    }
+
+    #[test]
+    fn test_storage_first_index() {
+        in_temp_dir!({
+            let ents = vec![new_entry(3, 3), new_entry(4, 4), new_entry(5, 5)];
+            let storage = NodeStorage::create(1).unwrap();
+            storage.0.set_entries(&ents);
+
+            assert_eq!(storage.first_index(), Ok(3));
+            storage.compact(4).unwrap();
+            assert_eq!(storage.first_index(), Ok(4));
+        });
+    }
+
+    #[test]
+    fn test_storage_compact() {
+        let ents = vec![new_entry(3, 3), new_entry(4, 4), new_entry(5, 5)];
+        let mut tests = vec![(2, 3, 3, 3), (3, 3, 3, 3), (4, 4, 4, 2), (5, 5, 5, 1)];
+        for (i, (idx, windex, wterm, wlen)) in tests.drain(..).enumerate() {
+            in_temp_dir!({
+                let storage = NodeStorage::create(1).unwrap();
+                storage.0.set_entries(&ents);
+
+                storage.compact(idx).unwrap();
+                let index = storage.first_index().unwrap();
+                if index != windex {
+                    panic!("#{}: want {}, index {}", i, windex, index);
+                }
+                let term = if let Ok(v) =
+                    storage.entries(index, index + 1, 1, GetEntriesContext::empty(false))
+                {
+                    v.first().map_or(0, |e| e.term)
+                } else {
+                    0
+                };
+                if term != wterm {
+                    panic!("#{}: want {}, term {}", i, wterm, term);
+                }
+                let last = storage.last_index().unwrap();
+                let len = storage
+                    .entries(index, last + 1, 100, GetEntriesContext::empty(false))
+                    .unwrap()
+                    .len();
+                if len != wlen {
+                    panic!("#{}: want {}, term {}", i, wlen, len);
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn test_storage_create_snapshot() {
+        let ents = vec![new_entry(3, 3), new_entry(4, 4), new_entry(5, 5)];
+        let nodes = vec![1, 2, 3];
+        let mut conf_state = ConfState::default();
+        conf_state.voters = nodes.clone();
+
+        let unavailable = Err(RaftError::Store(
+            StorageError::SnapshotTemporarilyUnavailable,
+        ));
+        let mut tests = vec![
+            (4, Ok(new_snapshot(4, 4, nodes.clone())), 0),
+            (5, Ok(new_snapshot(5, 5, nodes.clone())), 5),
+            (5, Ok(new_snapshot(6, 5, nodes)), 6),
+            (5, unavailable, 6),
+        ];
+        for (i, (idx, wresult, windex)) in tests.drain(..).enumerate() {
+            in_temp_dir!({
+                let storage = NodeStorage::create(1).unwrap();
+                storage.0.set_entries(&ents);
+                let mut hs = storage.get_hard_state().unwrap();
+                hs.commit = idx;
+                hs.term = idx;
+
+                storage.set_hard_state(&hs);
+                storage.set_conf_state(&conf_state);
+
+                let result = storage.snapshot(windex, 0);
+                if result != wresult {
+                    panic!("#{}: want {:?}, got {:?}", i, wresult, result);
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn test_storage_append() {
+        let ents = vec![new_entry(3, 3), new_entry(4, 4), new_entry(5, 5)];
+        let mut tests = vec![
+            (
+                vec![new_entry(3, 3), new_entry(4, 4), new_entry(5, 5)],
+                Some(vec![new_entry(3, 3), new_entry(4, 4), new_entry(5, 5)]),
+            ),
+            (
+                vec![new_entry(3, 3), new_entry(4, 6), new_entry(5, 6)],
+                Some(vec![new_entry(3, 3), new_entry(4, 6), new_entry(5, 6)]),
+            ),
+            (
+                vec![
+                    new_entry(3, 3),
+                    new_entry(4, 4),
+                    new_entry(5, 5),
+                    new_entry(6, 5),
+                ],
+                Some(vec![
+                    new_entry(3, 3),
+                    new_entry(4, 4),
+                    new_entry(5, 5),
+                    new_entry(6, 5),
+                ]),
+            ),
+            // overwrite compacted raft logs is not allowed
+            (
+                vec![new_entry(2, 3), new_entry(3, 3), new_entry(4, 5)],
+                None,
+            ),
+            // truncate the existing entries and append
+            (
+                vec![new_entry(4, 5)],
+                Some(vec![new_entry(3, 3), new_entry(4, 5)]),
+            ),
+            // direct append
+            (
+                vec![new_entry(6, 6)],
+                Some(vec![
+                    new_entry(3, 3),
+                    new_entry(4, 4),
+                    new_entry(5, 5),
+                    new_entry(6, 6),
+                ]),
+            ),
+        ];
+        for (i, (entries, wentries)) in tests.drain(..).enumerate() {
+            in_temp_dir!({
+                let storage = NodeStorage::create(1).unwrap();
+                storage.0.set_entries(&ents);
+                let res = panic::catch_unwind(AssertUnwindSafe(|| storage.append(&entries)));
+                if let Some(wentries) = wentries {
+                    let _ = res.unwrap();
+                    let e = &storage
+                        .entries(
+                            0,
+                            storage.last_index().unwrap() + 1,
+                            None,
+                            GetEntriesContext::empty(false),
+                        )
+                        .unwrap();
+
+                    if *e != wentries {
+                        panic!("#{}: want {:?}, entries {:?}", i, wentries, e);
+                    }
+                } else {
+                    res.unwrap_err();
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn test_storage_apply_snapshot() {
+        let nodes = vec![1, 2, 3];
+        in_temp_dir!({
+            let storage = NodeStorage::create(1).unwrap();
+
+            // Apply snapshot successfully
+            let snap = new_snapshot(4, 4, nodes.clone());
+            storage.apply_snapshot(snap).unwrap();
+
+            // Apply snapshot fails due to StorageError::SnapshotOutOfDate
+            let snap = new_snapshot(3, 3, nodes);
+            storage.apply_snapshot(snap).unwrap_err();
+        });
     }
 }
