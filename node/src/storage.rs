@@ -18,7 +18,6 @@ const ENTRIES_INDEX: &str = "snapshot";
 const METADATA_INDEX: &str = "metadata";
 
 const SNAPSHOT_METADATA_KEY: &str = "snapshot";
-const LAST_INDEX_KEY: &str = "last_index";
 const HARD_STATE_KEY: &str = "hard_state";
 const CONF_STATE_KEY: &str = "conf_state";
 
@@ -33,7 +32,7 @@ impl NodeStorageCore {
 
         let store = Self { persy };
 
-        tx.create_index::<u64, ByteVec>(ENTRIES_INDEX, ValueMode::Exclusive)?;
+        tx.create_index::<u64, ByteVec>(ENTRIES_INDEX, ValueMode::Replace)?;
         tx.create_index::<String, ByteVec>(METADATA_INDEX, ValueMode::Replace)?;
 
         store.set_hard_state(&mut tx, &HardState::default())?;
@@ -81,27 +80,37 @@ impl NodeStorageCore {
         Ok(())
     }
 
-    pub fn set_last_index(&self, tx: &mut Transaction, last_index: u64) -> Result<()> {
-        tx.put::<String, ByteVec>(
-            METADATA_INDEX,
-            LAST_INDEX_KEY.to_string(),
-            last_index.to_le_bytes().to_vec().into(),
-        )?;
-
-        Ok(())
-    }
-
     pub fn append_entries(&self, tx: &mut Transaction, entries: &[Entry]) -> Result<()> {
-        let mut last_index = self.get_last_index(tx)?;
-
         println!("APPENDING ENTRIES");
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let first_index = self.get_first_index(tx)?;
+        let last_index = self.get_last_index(tx)?;
+
+        if first_index > entries[0].index {
+            panic!(
+                "overwrite compacted raft logs, compacted: {}, append: {}",
+                first_index - 1,
+                entries[0].index,
+            );
+        }
+
+        if last_index + 1 < entries[0].index {
+            panic!(
+                "raft logs should be continuous, last index: {}, new appended: {}",
+                last_index, entries[0].index,
+            );
+        }
+
         for entry in entries {
             let index = entry.index;
-            println!("APPENDING ENTRY to index {}", index);
-            last_index = std::cmp::max(last_index, index);
+            println!("APPENDING ENTRY to index {index} term {}", entry.term);
             tx.put::<u64, ByteVec>(ENTRIES_INDEX, index, entry.write_to_bytes()?.into())?;
         }
-        self.set_last_index(tx, last_index)
+
+        Ok(())
     }
 
     pub fn get_hard_state(&self, tx: &mut Transaction) -> Result<HardState> {
@@ -157,12 +166,23 @@ impl NodeStorageCore {
     }
 
     pub fn get_last_index(&self, tx: &mut Transaction) -> Result<u64> {
-        let mut data = tx.get::<String, ByteVec>(METADATA_INDEX, &LAST_INDEX_KEY.into())?;
+        // let mut data = tx.get::<String, ByteVec>(METADATA_INDEX, &LAST_INDEX_KEY.into())?;
 
-        if let Some(data) = data.nth(0) {
-            Ok(u64::from_le_bytes(
-                data[..].try_into().map_err(|_| Error::ConverstionError)?,
-            ))
+        // if let Some(data) = data.nth(0) {
+        //     Ok(u64::from_le_bytes(
+        //         data[..].try_into().map_err(|_| Error::ConverstionError)?,
+        //     ))
+        // } else {
+        //     Ok(self.get_snapshot_metadata(tx)?.index)
+        // }
+
+        let mut iter: TxIndexIter<u64, ByteVec> = tx.range(ENTRIES_INDEX, ..)?;
+
+        if let Some(mut e) = iter.last() {
+            let e = Entry::parse_from_bytes(&e.1.nth(0).unwrap())
+                .expect("Entry bytes should not be malformed.");
+
+            Ok(e.index)
         } else {
             Ok(self.get_snapshot_metadata(tx)?.index)
         }
@@ -227,12 +247,11 @@ impl NodeStorageCore {
         tx.drop_index(ENTRIES_INDEX)?;
         tx.create_index::<u64, ByteVec>(ENTRIES_INDEX, ValueMode::Exclusive)?;
 
-        // let mut to_add = [Entry::default()].to_vec();
-        // to_add.append(&mut entries.to_vec());
-
-        // self.append_entries(&mut tx, &to_add)?;
-
-        self.append_entries(&mut tx, entries)?;
+        for entry in entries {
+            let index = entry.index;
+            println!("SETTING ENTRY at index {index} term {}", entry.term);
+            tx.put::<u64, ByteVec>(ENTRIES_INDEX, index, entry.write_to_bytes()?.into())?;
+        }
 
         tx.prepare()?.commit()?;
         Ok(())
@@ -460,7 +479,6 @@ impl LogStore for NodeStorage {
 
         store.set_hard_state(&mut tx, &hard_state)?;
         store.set_conf_state(&mut tx, &conf_state)?;
-        store.set_last_index(&mut tx, metadata.index)?;
         store.set_snapshot_metadata(&mut tx, metadata)?;
 
         tx.prepare()?.commit()?;
@@ -749,17 +767,15 @@ mod test {
         for (i, (entries, wentries)) in tests.drain(..).enumerate() {
             in_temp_dir!({
                 let storage = NodeStorage::create(1).unwrap();
-                storage.0.set_entries(&ents);
+                let mut tx = storage.0.persy.begin().unwrap();
+                storage.0.set_entries(&ents).unwrap();
+
                 let res = panic::catch_unwind(AssertUnwindSafe(|| storage.append(&entries)));
                 if let Some(wentries) = wentries {
                     let _ = res.unwrap();
                     let e = &storage
-                        .entries(
-                            0,
-                            storage.last_index().unwrap() + 1,
-                            None,
-                            GetEntriesContext::empty(false),
-                        )
+                        .0
+                        .get_entries(0, storage.last_index().unwrap() + 1, None, &mut tx)
                         .unwrap();
 
                     if *e != wentries {
