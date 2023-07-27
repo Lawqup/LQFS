@@ -104,6 +104,10 @@ impl NodeStorageCore {
             );
         }
 
+        for index in entries[0].index..=last_index {
+            tx.remove::<u64, ByteVec>(ENTRIES_INDEX, index, None)?;
+        }
+
         for entry in entries {
             let index = entry.index;
             println!("APPENDING ENTRY to index {index} term {}", entry.term);
@@ -166,17 +170,7 @@ impl NodeStorageCore {
     }
 
     pub fn get_last_index(&self, tx: &mut Transaction) -> Result<u64> {
-        // let mut data = tx.get::<String, ByteVec>(METADATA_INDEX, &LAST_INDEX_KEY.into())?;
-
-        // if let Some(data) = data.nth(0) {
-        //     Ok(u64::from_le_bytes(
-        //         data[..].try_into().map_err(|_| Error::ConverstionError)?,
-        //     ))
-        // } else {
-        //     Ok(self.get_snapshot_metadata(tx)?.index)
-        // }
-
-        let mut iter: TxIndexIter<u64, ByteVec> = tx.range(ENTRIES_INDEX, ..)?;
+        let iter: TxIndexIter<u64, ByteVec> = tx.range(ENTRIES_INDEX, ..)?;
 
         if let Some(mut e) = iter.last() {
             let e = Entry::parse_from_bytes(&e.1.nth(0).unwrap())
