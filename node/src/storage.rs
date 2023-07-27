@@ -6,6 +6,8 @@ use persy::{ByteVec, Persy, Transaction, TxIndexIter, ValueMode};
 use protobuf::Message;
 use raft::{prelude::*, Storage};
 
+use protobuf::Message as PbMessage;
+
 use crate::prelude::Result;
 
 pub struct NodeStorageCore {
@@ -192,19 +194,22 @@ impl NodeStorageCore {
         let mut total_bytes = 0;
         let max_size = max_size.into();
 
-        Ok(iter
-            .take_while(|(_, e)| match max_size {
-                Some(max_size) => {
-                    total_bytes += e.len() as u64;
-                    total_bytes <= max_size
-                }
-                None => true,
-            })
-            .map(|(_, mut e)| {
-                Entry::parse_from_bytes(&e.nth(0).unwrap())
-                    .expect("Entry bytes should not be malformed.")
-            })
-            .collect())
+        let mut res = Vec::new();
+
+        for (i, (_, mut e)) in iter.enumerate() {
+            let entry = Entry::parse_from_bytes(&e.nth(0).unwrap())
+                .expect("Entry bytes should not be malformed.");
+
+            total_bytes += entry.compute_size() as u64;
+
+            if max_size.is_some_and(|max_size| total_bytes > max_size) && i != 0 {
+                break;
+            }
+
+            res.push(entry);
+        }
+
+        Ok(res)
     }
 
     pub fn get_entry(&self, index: u64, tx: &mut Transaction) -> Result<Entry> {
@@ -261,11 +266,6 @@ impl Storage for NodeStorage {
                 .map_err(|e| raft::Error::Store(raft::StorageError::Other(e.into())))?,
         };
 
-        tx.prepare()
-            .map_err(|e| raft::Error::Store(raft::StorageError::Other(e.into())))?
-            .commit()
-            .map_err(|e| raft::Error::Store(raft::StorageError::Other(e.into())))?;
-
         Ok(state)
     }
 
@@ -282,14 +282,17 @@ impl Storage for NodeStorage {
             .begin()
             .map_err(|e| raft::Error::Store(raft::StorageError::Other(e.into())))?;
 
+        if low
+            < store
+                .get_first_index(&mut tx)
+                .map_err(|_| raft::Error::Store(raft::StorageError::Unavailable))?
+        {
+            return Err(raft::Error::Store(raft::StorageError::Compacted));
+        }
+
         let res = store
             .get_entries(low, high, max_size, &mut tx)
             .map_err(|e| raft::Error::Store(raft::StorageError::Other(e.into())));
-
-        tx.prepare()
-            .map_err(|e| raft::Error::Store(raft::StorageError::Other(e.into())))?
-            .commit()
-            .map_err(|e| raft::Error::Store(raft::StorageError::Other(e.into())))?;
 
         res
     }
@@ -326,11 +329,6 @@ impl Storage for NodeStorage {
                 .map(|e| e.term)
         };
 
-        tx.prepare()
-            .map_err(|e| raft::Error::Store(raft::StorageError::Other(e.into())))?
-            .commit()
-            .map_err(|e| raft::Error::Store(raft::StorageError::Other(e.into())))?;
-
         res
     }
 
@@ -344,11 +342,6 @@ impl Storage for NodeStorage {
         let first_index = store
             .get_first_index(&mut tx)
             .map_err(|_| raft::Error::Store(raft::StorageError::Unavailable));
-
-        tx.prepare()
-            .map_err(|e| raft::Error::Store(raft::StorageError::Other(e.into())))?
-            .commit()
-            .map_err(|e| raft::Error::Store(raft::StorageError::Other(e.into())))?;
 
         first_index
     }
@@ -364,11 +357,6 @@ impl Storage for NodeStorage {
             .get_last_index(&mut tx)
             .map_err(|_| raft::Error::Store(raft::StorageError::Unavailable));
 
-        tx.prepare()
-            .map_err(|e| raft::Error::Store(raft::StorageError::Other(e.into())))?
-            .commit()
-            .map_err(|e| raft::Error::Store(raft::StorageError::Other(e.into())))?;
-
         last_index
     }
 
@@ -382,11 +370,6 @@ impl Storage for NodeStorage {
         let snap = store
             .get_snapshot(&mut tx)
             .map_err(|_| raft::Error::Store(raft::StorageError::SnapshotTemporarilyUnavailable));
-
-        tx.prepare()
-            .map_err(|e| raft::Error::Store(raft::StorageError::Other(e.into())))?
-            .commit()
-            .map_err(|e| raft::Error::Store(raft::StorageError::Other(e.into())))?;
 
         snap
     }
@@ -715,46 +698,6 @@ mod test {
             });
         }
     }
-
-    // #[test]
-    // fn test_storage_create_snapshot() {
-    //     let ents = vec![new_entry(3, 3), new_entry(4, 4), new_entry(5, 5)];
-    //     let nodes = vec![1, 2, 3];
-    //     let mut conf_state = ConfState::default();
-    //     conf_state.voters = nodes.clone();
-
-    //     let unavailable = Err(RaftError::Store(
-    //         StorageError::SnapshotTemporarilyUnavailable,
-    //     ));
-    //     let mut tests = vec![
-    //         (4, Ok(new_snapshot(4, 4, nodes.clone())), 0),
-    //         (5, Ok(new_snapshot(5, 5, nodes.clone())), 5),
-    //         (5, Ok(new_snapshot(6, 5, nodes)), 6),
-    //         (5, unavailable, 6),
-    //     ];
-    //     for (i, (idx, wresult, windex)) in tests.drain(..).enumerate() {
-    //         in_temp_dir!({
-    //             let storage = NodeStorage::create(1).unwrap();
-    //             storage.0.set_entries(&ents);
-    //             let mut hs = storage.get_hard_state().unwrap();
-    //             hs.commit = idx;
-    //             hs.term = idx;
-
-    //             storage.set_hard_state(&hs);
-    //             storage.set_conf_state(&conf_state);
-
-    //             let mut meta = SnapshotMetadata::default();
-    //             meta.set_conf_state(conf_state.clone());
-
-    //             storage.create_snapshot(Vec::new());
-
-    //             let result = storage.snapshot(windex, 0);
-    //             if result != wresult {
-    //                 panic!("#{}: want {:?}, got {:?}", i, wresult, result);
-    //             }
-    //         });
-    //     }
-    // }
 
     #[test]
     fn test_storage_append() {
