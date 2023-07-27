@@ -1,12 +1,8 @@
 use std::{cmp::Ordering, sync::Arc};
 
-use crate::prelude::*;
-
 use persy::{ByteVec, Persy, Transaction, TxIndexIter, ValueMode};
 use protobuf::Message;
 use raft::{prelude::*, Storage};
-
-use protobuf::Message as PbMessage;
 
 use crate::prelude::Result;
 
@@ -46,6 +42,8 @@ impl NodeStorageCore {
 
     pub fn set_hard_state(&self, tx: &mut Transaction, hard_state: &HardState) -> Result<()> {
         println!("SETTING HARDSTATE: {:?}", hard_state);
+        tx.remove::<String, ByteVec>(METADATA_INDEX, HARD_STATE_KEY.to_string(), None)?;
+
         tx.put::<String, ByteVec>(
             METADATA_INDEX,
             HARD_STATE_KEY.to_string(),
@@ -57,6 +55,8 @@ impl NodeStorageCore {
 
     pub fn set_conf_state(&self, tx: &mut Transaction, conf_state: &ConfState) -> Result<()> {
         println!("SETTING CONFSTATE: {:?}", conf_state);
+        tx.remove::<String, ByteVec>(METADATA_INDEX, CONF_STATE_KEY.to_string(), None)?;
+
         tx.put::<String, ByteVec>(
             METADATA_INDEX,
             CONF_STATE_KEY.to_string(),
@@ -71,6 +71,8 @@ impl NodeStorageCore {
         tx: &mut Transaction,
         metadata: &SnapshotMetadata,
     ) -> Result<()> {
+        tx.remove::<String, ByteVec>(METADATA_INDEX, SNAPSHOT_METADATA_KEY.to_string(), None)?;
+
         tx.put::<String, ByteVec>(
             METADATA_INDEX,
             SNAPSHOT_METADATA_KEY.to_string(),
@@ -110,7 +112,6 @@ impl NodeStorageCore {
 
         for entry in entries {
             let index = entry.index;
-            println!("APPENDING ENTRY to index {index} term {}", entry.term);
             tx.put::<u64, ByteVec>(ENTRIES_INDEX, index, entry.write_to_bytes()?.into())?;
         }
 
@@ -161,12 +162,8 @@ impl NodeStorageCore {
             Ordering::Greater => self.get_entry(meta.index, tx)?.term,
         };
 
-        let data = &tx
-            .get::<String, ByteVec>(METADATA_INDEX, &SNAPSHOT_METADATA_KEY.into())?
-            .nth(0)
-            .unwrap();
-
-        Ok(Snapshot::parse_from_bytes(data)?)
+        meta.set_conf_state(self.get_conf_state(tx)?);
+        Ok(snapshot)
     }
 
     pub fn get_last_index(&self, tx: &mut Transaction) -> Result<u64> {
@@ -243,7 +240,6 @@ impl NodeStorageCore {
 
         for entry in entries {
             let index = entry.index;
-            println!("SETTING ENTRY at index {index} term {}", entry.term);
             tx.put::<u64, ByteVec>(ENTRIES_INDEX, index, entry.write_to_bytes()?.into())?;
         }
 
@@ -327,8 +323,6 @@ impl Storage for NodeStorage {
             .get_hard_state(&mut tx)
             .map_err(|_| raft::Error::Store(raft::StorageError::Unavailable))?;
 
-        println!("GOT STUFF first: {first_index} last: {last_index} hs: {hs:?}");
-
         let res = if idx == hs.commit {
             Ok(hs.term)
         } else if idx < first_index {
@@ -373,18 +367,22 @@ impl Storage for NodeStorage {
         last_index
     }
 
-    fn snapshot(&self, _request_index: u64, _to: u64) -> raft::Result<Snapshot> {
+    fn snapshot(&self, request_index: u64, _to: u64) -> raft::Result<Snapshot> {
         let store = &self.0;
         let mut tx = store
             .persy
             .begin()
             .map_err(|_| raft::Error::Store(raft::StorageError::Unavailable))?;
 
-        let snap = store
+        let mut snap = store
             .get_snapshot(&mut tx)
-            .map_err(|_| raft::Error::Store(raft::StorageError::SnapshotTemporarilyUnavailable));
+            .map_err(|_| raft::Error::Store(raft::StorageError::SnapshotTemporarilyUnavailable))?;
 
-        snap
+        if snap.get_metadata().index < request_index {
+            snap.mut_metadata().index = request_index;
+        }
+
+        Ok(snap)
     }
 }
 
@@ -456,11 +454,6 @@ impl LogStore for NodeStorage {
 
         let metadata = snapshot.get_metadata();
 
-        println!(
-            "FIRST {} META {}",
-            self.0.get_first_index(&mut tx)?,
-            metadata.index
-        );
         if self.0.get_first_index(&mut tx)? > metadata.index {
             Err(raft::Error::Store(raft::StorageError::SnapshotOutOfDate))?;
         }
@@ -645,7 +638,7 @@ mod test {
         in_temp_dir!({
             let ents = vec![new_entry(3, 3), new_entry(4, 4), new_entry(5, 5)];
             let storage = NodeStorage::create(1).unwrap();
-            storage.0.set_entries(&ents);
+            storage.0.set_entries(&ents).unwrap();
 
             let wresult = Ok(5);
             let result = storage.last_index();
@@ -667,7 +660,7 @@ mod test {
         in_temp_dir!({
             let ents = vec![new_entry(3, 3), new_entry(4, 4), new_entry(5, 5)];
             let storage = NodeStorage::create(1).unwrap();
-            storage.0.set_entries(&ents);
+            storage.0.set_entries(&ents).unwrap();
 
             assert_eq!(storage.first_index(), Ok(3));
             storage.compact(4).unwrap();
@@ -682,7 +675,7 @@ mod test {
         for (i, (idx, windex, wterm, wlen)) in tests.drain(..).enumerate() {
             in_temp_dir!({
                 let storage = NodeStorage::create(1).unwrap();
-                storage.0.set_entries(&ents);
+                storage.0.set_entries(&ents).unwrap();
 
                 storage.compact(idx).unwrap();
                 let index = storage.first_index().unwrap();
@@ -777,6 +770,38 @@ mod test {
                     }
                 } else {
                     res.unwrap_err();
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn test_storage_create_snapshot() {
+        let ents = vec![new_entry(3, 3), new_entry(4, 4), new_entry(5, 5)];
+        let nodes = vec![1, 2, 3];
+        let mut conf_state = ConfState::default();
+        conf_state.voters = nodes.clone();
+
+        let mut tests = vec![
+            (4, Ok(new_snapshot(4, 4, nodes.clone())), 0),
+            (5, Ok(new_snapshot(5, 5, nodes.clone())), 5),
+            (5, Ok(new_snapshot(6, 5, nodes)), 6),
+        ];
+        for (i, (idx, wresult, windex)) in tests.drain(..).enumerate() {
+            in_temp_dir!({
+                let storage = NodeStorage::create(1).unwrap();
+                storage.0.set_entries(&ents).unwrap();
+
+                let mut hs = storage.get_hard_state().unwrap();
+                hs.commit = idx;
+                hs.term = idx;
+
+                storage.set_hard_state(&hs).unwrap();
+                storage.set_conf_state(&conf_state).unwrap();
+
+                let result = storage.snapshot(windex, 0);
+                if result != wresult {
+                    panic!("#{}: want {:?}, got {:?}", i, wresult, result);
                 }
             });
         }

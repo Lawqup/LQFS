@@ -227,8 +227,6 @@ impl Node {
         let mut ready = raft.ready();
         let store = raft.store().clone();
 
-        debug!(self.logger, "READY: {ready:?}");
-
         if !ready.entries().is_empty() {
             store.append(ready.entries()).unwrap();
         }
@@ -238,7 +236,6 @@ impl Node {
             store
                 .set_hard_state(hs)
                 .expect("Could not update hard state");
-            debug!(self.logger, "HARDSTATE: {:?}", store.get_hard_state());
         }
 
         if !ready.messages().is_empty() {
