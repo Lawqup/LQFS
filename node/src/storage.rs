@@ -40,8 +40,16 @@ impl NodeStorageCore {
         Ok(store)
     }
 
+    pub fn restore(id: u64) -> Result<Self> {
+        let path = format!("store/raft-{id}.mdb");
+
+        println!("Restoring {path}");
+        let persy: Persy = Persy::open(path, persy::Config::new())?;
+
+        Ok(Self { persy })
+    }
+
     pub fn set_hard_state(&self, tx: &mut Transaction, hard_state: &HardState) -> Result<()> {
-        println!("SETTING HARDSTATE: {:?}", hard_state);
         tx.remove::<String, ByteVec>(METADATA_INDEX, HARD_STATE_KEY.to_string(), None)?;
 
         tx.put::<String, ByteVec>(
@@ -54,7 +62,6 @@ impl NodeStorageCore {
     }
 
     pub fn set_conf_state(&self, tx: &mut Transaction, conf_state: &ConfState) -> Result<()> {
-        println!("SETTING CONFSTATE: {:?}", conf_state);
         tx.remove::<String, ByteVec>(METADATA_INDEX, CONF_STATE_KEY.to_string(), None)?;
 
         tx.put::<String, ByteVec>(
@@ -83,7 +90,6 @@ impl NodeStorageCore {
     }
 
     pub fn append_entries(&self, tx: &mut Transaction, entries: &[Entry]) -> Result<()> {
-        println!("APPENDING ENTRIES");
         if entries.is_empty() {
             return Ok(());
         }
@@ -254,6 +260,11 @@ pub struct NodeStorage(Arc<NodeStorageCore>);
 impl NodeStorage {
     pub fn create(id: u64) -> Result<Self> {
         let core = NodeStorageCore::create(id)?;
+        Ok(Self(Arc::new(core)))
+    }
+
+    pub fn restore(id: u64) -> Result<Self> {
+        let core = NodeStorageCore::restore(id)?;
         Ok(Self(Arc::new(core)))
     }
 }

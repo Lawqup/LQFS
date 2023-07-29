@@ -148,6 +148,12 @@ impl NetworkController {
         self.client_responders[&response.to].send(response).unwrap();
     }
 
+    pub fn add_client(&mut self, client_id: u64) -> Receiver<Response> {
+        let (tx, rx) = mpsc::channel();
+        self.client_responders.insert(client_id, tx);
+        rx
+    }
+
     pub fn peers(&self) -> Vec<u64> {
         self.raft_senders.keys().copied().collect()
     }
