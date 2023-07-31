@@ -6,16 +6,18 @@ pub use slog::{debug, error, info, o, Drain, Logger};
 use thiserror::Error as ThisError;
 pub use uuid::Uuid;
 
+use crate::fs::fragment::Fragment;
+
 #[derive(Clone, Debug)]
 pub struct Proposal {
     pub id: Uuid,
     pub from: u64,
     pub conf_change: Option<ConfChange>,
-    pub fragment: Option<Vec<u8>>,
+    pub fragment: Option<Fragment>,
 }
 
 impl Proposal {
-    pub fn new_fragment(from: u64, fragment: Vec<u8>) -> Self {
+    pub fn new_fragment(from: u64, fragment: Fragment) -> Self {
         Self {
             id: Uuid::new_v4(),
             from,

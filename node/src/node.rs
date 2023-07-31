@@ -10,6 +10,7 @@ use std::{
 };
 
 use crate::{
+    fs::fragment::Fragment,
     network::{Network, QueryMsg, RequestMsg, Response, ResponseMsg, Signal},
     prelude::*,
     storage::{LogStore, NodeStorage},
@@ -221,7 +222,8 @@ impl Node {
         let index_before = self.raft_mut().raft.raft_log.last_index();
         let ctx = prop.context_bytes();
         if let Some(frag) = &prop.fragment {
-            let _ = self.raft_mut().propose(ctx, frag.to_vec());
+            let bytes = frag.write_to_bytes().unwrap();
+            let _ = self.raft_mut().propose(ctx, bytes);
         } else if let Some(cc) = &prop.conf_change {
             let _ = self.raft_mut().propose_conf_change(ctx, cc.clone());
         }
@@ -322,7 +324,7 @@ impl Node {
             let (prop_id, prop_from) = Proposal::context_from_bytes(entry.get_context());
             match entry.get_entry_type() {
                 EntryType::EntryNormal => {
-                    let fragment = entry.get_data().to_vec();
+                    let fragment = Fragment::parse_from_bytes(entry.get_data()).unwrap();
 
                     info!(
                         self.logger,

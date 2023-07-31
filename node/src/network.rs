@@ -10,8 +10,6 @@ use std::{
         mpsc::{self, Receiver, Sender},
         Arc, Mutex,
     },
-    thread,
-    time::Duration,
 };
 
 /// RequestMsgs are all messages sent to nodes
@@ -121,23 +119,7 @@ impl NetworkController {
     }
 
     pub fn listen_for_proposals(&mut self) {
-        let logger = self.logger.clone();
-        let raft_senders = self.raft_senders.clone();
-        let clients: Vec<u64> = self.client_responders.keys().copied().collect();
-        thread::spawn(move || {
-            // TODO set up an endpoint and listen to client
-
-            for (i, c) in (0..10).zip(clients.into_iter().cycle()) {
-                thread::sleep(Duration::from_millis(1500));
-
-                info!(logger, "Proposing {i}!");
-                let prop = &Proposal::new_fragment(c, vec![]);
-
-                for tx in raft_senders.values() {
-                    tx.send(RequestMsg::Propose(prop.clone())).unwrap();
-                }
-            }
-        });
+        todo!()
     }
 
     pub fn get_node_rx(&self, node_id: u64) -> &Receiver<RequestMsg> {

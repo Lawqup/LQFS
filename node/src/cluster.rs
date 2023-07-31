@@ -152,10 +152,12 @@ mod test {
     };
 
     use ntest::{test_case, timeout};
+    use protobuf::Message;
     use raft::StateRole;
 
     use crate::{
         cluster::{init_cluster, restore_cluster, InitResult},
+        fs::fragment::Fragment,
         network::{Network, RequestMsg, Response, ResponseMsg, Signal},
         prelude::*,
     };
@@ -185,7 +187,13 @@ mod test {
     ) -> JoinHandle<()> {
         let proposals: HashMap<Uuid, Proposal> = (0..n_proposals)
             .map(|i| {
-                let prop = Proposal::new_fragment(client_id, i.to_le_bytes().to_vec());
+                let frag = Fragment {
+                    file_idx: i as u64,
+                    data: b"hello".to_vec(),
+                    ..Default::default()
+                };
+                dbg!(&frag);
+                let prop = Proposal::new_fragment(client_id, frag);
                 (prop.id, prop)
             })
             .collect();

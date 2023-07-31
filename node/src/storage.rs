@@ -404,6 +404,7 @@ impl LogStore for NodeStorage {
         let store = &self.0;
         let mut tx = store.persy.begin()?;
 
+        dbg!(entries);
         store.append_entries(&mut tx, entries)?;
 
         tx.prepare()?.commit()?;
