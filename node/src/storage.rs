@@ -127,7 +127,7 @@ impl NodeStorageCore {
     pub fn get_hard_state(&self, tx: &mut Transaction) -> Result<HardState> {
         let data = &tx
             .get::<String, ByteVec>(METADATA_INDEX, &HARD_STATE_KEY.into())?
-            .nth(0)
+            .next()
             .unwrap();
 
         Ok(HardState::parse_from_bytes(data)?)
@@ -136,7 +136,7 @@ impl NodeStorageCore {
     pub fn get_conf_state(&self, tx: &mut Transaction) -> Result<ConfState> {
         let data = &tx
             .get::<String, ByteVec>(METADATA_INDEX, &CONF_STATE_KEY.into())?
-            .nth(0)
+            .next()
             .unwrap();
 
         Ok(ConfState::parse_from_bytes(data)?)
@@ -145,7 +145,7 @@ impl NodeStorageCore {
     pub fn get_snapshot_metadata(&self, tx: &mut Transaction) -> Result<SnapshotMetadata> {
         let data = &tx
             .get::<String, ByteVec>(METADATA_INDEX, &SNAPSHOT_METADATA_KEY.into())?
-            .nth(0)
+            .next()
             .unwrap();
 
         Ok(SnapshotMetadata::parse_from_bytes(data)?)
@@ -176,7 +176,7 @@ impl NodeStorageCore {
         let iter: TxIndexIter<u64, ByteVec> = tx.range(ENTRIES_INDEX, ..)?;
 
         if let Some(mut e) = iter.last() {
-            let e = Entry::parse_from_bytes(&e.1.nth(0).unwrap())
+            let e = Entry::parse_from_bytes(&e.1.next().unwrap())
                 .expect("Entry bytes should not be malformed.");
 
             Ok(e.index)
@@ -188,8 +188,8 @@ impl NodeStorageCore {
     pub fn get_first_index(&self, tx: &mut Transaction) -> Result<u64> {
         let mut iter: TxIndexIter<u64, ByteVec> = tx.range(ENTRIES_INDEX, ..)?;
 
-        if let Some(mut e) = iter.nth(0) {
-            let e = Entry::parse_from_bytes(&e.1.nth(0).unwrap())
+        if let Some(mut e) = iter.next() {
+            let e = Entry::parse_from_bytes(&e.1.next().unwrap())
                 .expect("Entry bytes should not be malformed.");
 
             Ok(e.index)
@@ -214,7 +214,7 @@ impl NodeStorageCore {
         let mut res = Vec::new();
 
         for (i, (_, mut e)) in iter.enumerate() {
-            let entry = Entry::parse_from_bytes(&e.nth(0).unwrap())
+            let entry = Entry::parse_from_bytes(&e.next().unwrap())
                 .expect("Entry bytes should not be malformed.");
 
             total_bytes += entry.compute_size() as u64;
@@ -232,7 +232,7 @@ impl NodeStorageCore {
     pub fn get_entry(&self, index: u64, tx: &mut Transaction) -> Result<Entry> {
         let data = tx
             .get::<u64, ByteVec>(ENTRIES_INDEX, &index)?
-            .nth(0)
+            .next()
             .ok_or(raft::Error::Store(raft::StorageError::Unavailable))?;
 
         Ok(Entry::parse_from_bytes(&data)?)
@@ -310,11 +310,9 @@ impl Storage for NodeStorage {
             return Err(raft::Error::Store(raft::StorageError::Compacted));
         }
 
-        let res = store
+        store
             .get_entries(low, high, max_size, &mut tx)
-            .map_err(|e| raft::Error::Store(raft::StorageError::Other(e.into())));
-
-        res
+            .map_err(|e| raft::Error::Store(raft::StorageError::Other(e.into())))
     }
 
     fn term(&self, idx: u64) -> raft::Result<u64> {
@@ -334,7 +332,7 @@ impl Storage for NodeStorage {
             .get_hard_state(&mut tx)
             .map_err(|_| raft::Error::Store(raft::StorageError::Unavailable))?;
 
-        let res = if idx == hs.commit {
+        if idx == hs.commit {
             Ok(hs.term)
         } else if idx < first_index {
             Err(raft::Error::Store(raft::StorageError::Compacted))
@@ -345,9 +343,7 @@ impl Storage for NodeStorage {
                 .get_entry(idx, &mut tx)
                 .map_err(|_| raft::Error::Store(raft::StorageError::Unavailable))
                 .map(|e| e.term)
-        };
-
-        res
+        }
     }
 
     fn first_index(&self) -> raft::Result<u64> {
@@ -357,11 +353,9 @@ impl Storage for NodeStorage {
             .begin()
             .map_err(|_| raft::Error::Store(raft::StorageError::Unavailable))?;
 
-        let first_index = store
+        store
             .get_first_index(&mut tx)
-            .map_err(|_| raft::Error::Store(raft::StorageError::Unavailable));
-
-        first_index
+            .map_err(|_| raft::Error::Store(raft::StorageError::Unavailable))
     }
 
     fn last_index(&self) -> raft::Result<u64> {
@@ -371,11 +365,9 @@ impl Storage for NodeStorage {
             .begin()
             .map_err(|_| raft::Error::Store(raft::StorageError::Unavailable))?;
 
-        let last_index = store
+        store
             .get_last_index(&mut tx)
-            .map_err(|_| raft::Error::Store(raft::StorageError::Unavailable));
-
-        last_index
+            .map_err(|_| raft::Error::Store(raft::StorageError::Unavailable))
     }
 
     fn snapshot(&self, request_index: u64, _to: u64) -> raft::Result<Snapshot> {
@@ -453,7 +445,7 @@ impl LogStore for NodeStorage {
         metadata.set_index(hard_state.commit);
         metadata.set_term(hard_state.term);
 
-        store.set_snapshot_metadata(&mut tx, &metadata)?;
+        store.set_snapshot_metadata(&mut tx, metadata)?;
 
         tx.prepare()?.commit()?;
         Ok(())
@@ -476,7 +468,7 @@ impl LogStore for NodeStorage {
         hard_state.set_commit(metadata.index);
 
         store.set_hard_state(&mut tx, &hard_state)?;
-        store.set_conf_state(&mut tx, &conf_state)?;
+        store.set_conf_state(&mut tx, conf_state)?;
         store.set_snapshot_metadata(&mut tx, metadata)?;
 
         tx.prepare()?.commit()?;
@@ -535,10 +527,11 @@ mod test {
     }
 
     fn new_entry(index: u64, term: u64) -> Entry {
-        let mut e = Entry::default();
-        e.term = term;
-        e.index = index;
-        e
+        Entry {
+            term,
+            index,
+            ..Default::default()
+        }
     }
 
     fn size_of<T: PbMessage>(m: &T) -> u32 {
@@ -790,8 +783,10 @@ mod test {
     fn test_storage_create_snapshot() {
         let ents = vec![new_entry(3, 3), new_entry(4, 4), new_entry(5, 5)];
         let nodes = vec![1, 2, 3];
-        let mut conf_state = ConfState::default();
-        conf_state.voters = nodes.clone();
+        let conf_state = ConfState {
+            voters: nodes.clone(),
+            ..Default::default()
+        };
 
         let mut tests = vec![
             (4, Ok(new_snapshot(4, 4, nodes.clone())), 0),

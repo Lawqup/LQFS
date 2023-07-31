@@ -130,7 +130,7 @@ impl Node {
         config.id = msg.to;
         let storage = NodeStorage::create(self.id)?;
         self.raft = Some(RawNode::new(&config, storage, &self.logger)?);
-        return Ok(());
+        Ok(())
     }
 
     fn step(&mut self, msg: Message) {
@@ -194,9 +194,11 @@ impl Node {
                 raft.tick();
 
                 if let Some(follower) = self.followers_to_add.get(0) {
-                    let mut conf_change = ConfChange::default();
-                    conf_change.node_id = *follower;
-                    conf_change.set_change_type(ConfChangeType::AddNode);
+                    let conf_change = ConfChange {
+                        node_id: *follower,
+                        change_type: ConfChangeType::AddNode,
+                        ..Default::default()
+                    };
 
                     let prop = Proposal::new_conf_change(self.id, conf_change);
                     self.network.lock().unwrap().raft_senders[&self.id]

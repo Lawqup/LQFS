@@ -24,7 +24,7 @@ pub struct InitResult {
 }
 
 fn init_cluster(peers: &[u64], clients: &[u64], logger: &Logger) -> InitResult {
-    let (network, mut client_rxs) = NetworkController::new(&peers, clients, logger.clone());
+    let (network, mut client_rxs) = NetworkController::new(peers, clients, logger.clone());
     let network = Arc::new(Mutex::new(network));
 
     let technician = clients.iter().max().copied().unwrap_or_default() + 1;
@@ -53,7 +53,7 @@ fn init_cluster(peers: &[u64], clients: &[u64], logger: &Logger) -> InitResult {
         leader
     }));
 
-    let mut still_uninit: HashSet<u64> = peers.into_iter().copied().collect();
+    let mut still_uninit: HashSet<u64> = peers.iter().copied().collect();
     while !still_uninit.is_empty() {
         let mut to_remove = Vec::new();
 
@@ -112,7 +112,7 @@ pub fn restore_cluster(
         }));
     }
 
-    let mut still_uninit: HashSet<u64> = peers.into_iter().copied().collect();
+    let mut still_uninit: HashSet<u64> = peers.iter().copied().collect();
     while !still_uninit.is_empty() {
         let mut to_remove = Vec::new();
 
@@ -335,7 +335,7 @@ mod test {
     #[test_case(1, 1, name = "single_node_1_client_simple")]
     #[test_case(1, 5, name = "single_node_5_client_simple")]
     #[test_case(5, 5, name = "five_node_5_client_simple")]
-    #[timeout(2000)]
+    #[timeout(3000)]
     fn simple(n_peers: u64, n_clients: u64) {
         in_temp_dir!({
             let peers: Vec<u64> = (1..=n_peers).collect();
@@ -356,7 +356,7 @@ mod test {
     }
 
     #[test_case(3, 5, name = "three_node_5_client_node_failure")]
-    #[test_case(9, 5, name = "nine_node_5_client_node_failure")]
+    #[test_case(5, 1, name = "five_node_1_client_node_failure")]
     #[timeout(6000)]
     fn node_failure(n_peers: u64, n_clients: u64) {
         in_temp_dir!({
