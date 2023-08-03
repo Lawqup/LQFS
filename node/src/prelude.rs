@@ -6,7 +6,7 @@ pub use slog::{debug, error, info, o, Drain, Logger};
 use thiserror::Error as ThisError;
 pub use uuid::Uuid;
 
-use crate::fs::fragment::Fragment;
+use crate::frag::fragment::Fragment;
 
 #[derive(Clone, Debug)]
 pub struct Proposal {

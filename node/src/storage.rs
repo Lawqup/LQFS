@@ -19,7 +19,7 @@ const CONF_STATE_KEY: &str = "conf_state";
 
 impl NodeStorageCore {
     pub fn create(id: u64) -> Result<Self> {
-        let path = format!("store/raft-{id}.mdb");
+        let path = format!("store/node-{id}/raft.mdb");
 
         println!("CREATING {path}");
         Persy::create(&path)?;
@@ -41,7 +41,7 @@ impl NodeStorageCore {
     }
 
     pub fn restore(id: u64) -> Result<Self> {
-        let path = format!("store/raft-{id}.mdb");
+        let path = format!("store/node-{id}/raft.mdb");
 
         println!("Restoring {path}");
         let persy: Persy = Persy::open(path, persy::Config::new())?;
@@ -522,6 +522,7 @@ mod test {
             let tmpdir = tempfile::tempdir().unwrap();
             env::set_current_dir(&tmpdir).unwrap();
             fs::create_dir("store").unwrap();
+            fs::create_dir("store/node-1").unwrap();
 
             $block;
         };

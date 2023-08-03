@@ -152,12 +152,11 @@ mod test {
     };
 
     use ntest::{test_case, timeout};
-    use protobuf::Message;
     use raft::StateRole;
 
     use crate::{
         cluster::{init_cluster, restore_cluster, InitResult},
-        fs::fragment::Fragment,
+        frag::fragment::Fragment,
         network::{Network, RequestMsg, Response, ResponseMsg, Signal},
         prelude::*,
     };

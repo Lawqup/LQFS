@@ -4,13 +4,14 @@ use raft::{prelude::*, Config, RawNode, StateRole};
 use protobuf::Message as PbMessage;
 use std::{
     collections::VecDeque,
+    fs,
     path::Path,
     sync::mpsc::TryRecvError,
     time::{Duration, Instant},
 };
 
 use crate::{
-    fs::fragment::Fragment,
+    frag::fragment::Fragment,
     network::{Network, QueryMsg, RequestMsg, Response, ResponseMsg, Signal},
     prelude::*,
     storage::{LogStore, NodeStorage},
@@ -55,11 +56,11 @@ impl Node {
         config.id = id;
         config.validate().expect("Raft config should be valid");
 
-        let path = &format!("store/raft-{id}.mdb");
+        let path = &format!("store/node-{id}/");
         let path = Path::new(path);
 
         path.exists().then_some(()).ok_or(Error::InitError)?;
-        let storage = NodeStorage::restore(id).expect("Could not restore Node Storage");
+        let storage = NodeStorage::restore(id).expect("Could not restore node storage");
 
         let raft = Some(RawNode::new(&config, storage, &logger).unwrap());
 
@@ -84,7 +85,8 @@ impl Node {
         s.mut_metadata().term = 1;
         s.mut_metadata().mut_conf_state().voters = vec![id];
 
-        let storage = NodeStorage::create(id).expect("Could not create Node Storage");
+        fs::create_dir(format!("store/node-{id}/")).expect("Could not create storage directory");
+        let storage = NodeStorage::create(id).expect("Could not create node storage");
         storage.apply_snapshot(s).unwrap();
 
         let mut raft = Some(RawNode::new(&config, storage, &logger).unwrap());
@@ -129,6 +131,9 @@ impl Node {
 
         let mut config = Self::config();
         config.id = msg.to;
+
+        fs::create_dir(format!("store/node-{}/", self.id))
+            .expect("Could not create storage directory");
         let storage = NodeStorage::create(self.id)?;
         self.raft = Some(RawNode::new(&config, storage, &self.logger)?);
         Ok(())
