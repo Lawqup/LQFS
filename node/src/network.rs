@@ -1,6 +1,6 @@
 //! Deals with the global state across nodes
 
-use crate::prelude::*;
+use crate::{frag::fragment::Fragment, prelude::*};
 use raft::prelude::Message;
 use uuid::Uuid;
 
@@ -20,24 +20,28 @@ pub enum RequestMsg {
     Query(QueryMsg),
     /// Proposals that require consensus and return a response
     Propose(Proposal),
-    /// Intra-node messages that carry out drive consensus
+    /// Intra-node messages that drive consensus
     Raft(Message),
 }
 
+#[derive(Debug, Clone)]
 pub enum QueryMsg {
     IsInitialized { from: u64 },
+    ReadFrags { from: u64, file_name: String },
 }
 
 pub enum Signal {
     Shutdown,
 }
 
-#[derive(PartialEq)]
+#[derive(Debug)]
 pub enum ResponseMsg {
     Proposed { proposal_id: Uuid, success: bool },
     Initialized(bool),
+    Frags(Result<Vec<Fragment>>),
 }
 
+#[derive(Debug)]
 pub struct Response {
     pub to: u64,
     pub from: u64,

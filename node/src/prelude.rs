@@ -84,6 +84,8 @@ pub enum Error {
     InitError,
     #[error("key error")]
     KeyError,
+    #[error("entire file couldn't be retrieved")]
+    FileRetrievalError,
 }
 
 impl<T: Into<persy::PersyError>> From<persy::PE<T>> for Error {

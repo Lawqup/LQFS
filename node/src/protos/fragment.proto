@@ -1,7 +1,8 @@
 syntax = "proto3";
 
 message Fragment {
-  string uuid = 1;
+  string name = 1;
   uint64 file_idx = 2;
-  bytes data = 3;
+  uint64 total_frags = 3;
+  bytes data = 4;
 }

@@ -11,7 +11,7 @@ use std::{
 };
 
 use crate::{
-    frag::fragment::Fragment,
+    frag::{fragment::Fragment, FSManager},
     network::{Network, QueryMsg, RequestMsg, Response, ResponseMsg, Signal},
     prelude::*,
     storage::{LogStore, NodeStorage},
@@ -19,6 +19,7 @@ use crate::{
 
 pub struct Node {
     pub(crate) raft: Option<RawNode<NodeStorage>>,
+    fs: FSManager,
     network: Network,
     id: u64,
     followers_to_add: VecDeque<u64>,
@@ -67,6 +68,7 @@ impl Node {
         Ok(Self {
             raft,
             network,
+            fs: FSManager::new(id),
             followers_to_add: VecDeque::new(),
             id,
             logger,
@@ -103,6 +105,7 @@ impl Node {
         raft.as_mut().unwrap().raft.become_leader();
         Self {
             raft,
+            fs: FSManager::new(id),
             network,
             followers_to_add,
             id,
@@ -115,6 +118,7 @@ impl Node {
         let logger = logger.new(o!("tag" => format!("node_{id}")));
         Self {
             raft: None,
+            fs: FSManager::new(id),
             network,
             id,
             followers_to_add: VecDeque::new(),
@@ -175,6 +179,14 @@ impl Node {
                                 to: from,
                                 from: self.id,
                                 msg: ResponseMsg::Initialized(self.raft.is_some()),
+                            });
+                        }
+                        QueryMsg::ReadFrags { from, file_name } => {
+                            debug!(self.logger, "GOT READ FRAGS QUERY FROM {from}");
+                            network.respond_to_client(Response {
+                                to: from,
+                                from: self.id,
+                                msg: ResponseMsg::Frags(self.fs.get_frags(&file_name)),
                             });
                         }
                     },
@@ -331,10 +343,8 @@ impl Node {
                 EntryType::EntryNormal => {
                     let fragment = Fragment::parse_from_bytes(entry.get_data()).unwrap();
 
-                    info!(
-                        self.logger,
-                        "Applied fragment proposal from {prop_from} with data {:?}", fragment
-                    );
+                    self.fs.apply(fragment);
+                    info!(self.logger, "Applied fragment proposal from {prop_from}");
                 }
                 EntryType::EntryConfChange => {
                     info!(self.logger, "Applied ConfChange proposal from {prop_from}");

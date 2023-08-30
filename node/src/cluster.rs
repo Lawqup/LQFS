@@ -8,7 +8,7 @@ use std::{
 use slog::Logger;
 
 use crate::{
-    network::{QueryMsg, ResponseMsg},
+    network::{self, QueryMsg, ResponseMsg},
     prelude::*,
 };
 
@@ -19,7 +19,7 @@ use crate::{
 
 pub struct InitResult {
     network: Network,
-    client_rxs: HashMap<u64, Receiver<Response>>,
+    client_rxs: HashMap<u64, Arc<Mutex<Receiver<Response>>>>,
     node_handles: Vec<JoinHandle<Node>>,
 }
 
@@ -82,13 +82,16 @@ fn init_cluster(peers: &[u64], clients: &[u64], logger: &Logger) -> InitResult {
     client_rxs.remove(&technician);
     InitResult {
         network,
-        client_rxs,
+        client_rxs: client_rxs
+            .into_iter()
+            .map(|(c, rx)| (c, Arc::new(Mutex::new(rx))))
+            .collect(),
         node_handles,
     }
 }
 
-// Restores the cluster from persistent storage.
-// At least the leader's data must have been initialized.
+/// Restores the cluster from persistent storage.
+/// At least the leader's data must have been initialized.
 pub fn restore_cluster(
     peers: &[u64],
     clients: &[u64],
@@ -157,7 +160,7 @@ mod test {
     use crate::{
         cluster::{init_cluster, restore_cluster, InitResult},
         frag::fragment::Fragment,
-        network::{Network, RequestMsg, Response, ResponseMsg, Signal},
+        network::{Network, QueryMsg, RequestMsg, Response, ResponseMsg, Signal},
         prelude::*,
     };
 
@@ -180,15 +183,17 @@ mod test {
     fn spawn_client(
         client_id: u64,
         n_proposals: usize,
-        client_rx: Mutex<Receiver<Response>>,
+        client_rx: Arc<Mutex<Receiver<Response>>>,
         logger: Logger,
         network: Network,
     ) -> JoinHandle<()> {
         let proposals: HashMap<Uuid, Proposal> = (0..n_proposals)
             .map(|i| {
                 let frag = Fragment {
+                    name: client_id.to_string(),
                     file_idx: i as u64,
-                    data: b"hello".to_vec(),
+                    total_frags: n_proposals as u64,
+                    data: i.to_le_bytes().to_vec(),
                     ..Default::default()
                 };
                 dbg!(&frag);
@@ -258,7 +263,7 @@ mod test {
 
     fn spawn_clients(
         clients: &[u64],
-        mut client_rxs: HashMap<u64, Receiver<Response>>,
+        mut client_rxs: HashMap<u64, Arc<Mutex<Receiver<Response>>>>,
         logger: &Logger,
         network: Network,
     ) -> Vec<JoinHandle<()>> {
@@ -267,7 +272,7 @@ mod test {
             client_handles.push(spawn_client(
                 client_id,
                 N_PROPOSALS,
-                Mutex::new(client_rxs.remove(&client_id).unwrap()),
+                client_rxs.remove(&client_id).unwrap(),
                 logger.clone(),
                 network.clone(),
             ));
@@ -276,25 +281,108 @@ mod test {
         client_handles
     }
 
-    fn cleanup(
-        client_handles: Vec<JoinHandle<()>>,
-        node_handles: Vec<JoinHandle<Node>>,
+    /// As a client, attempts to get and recombine an entire file
+    /// by querying the whole cluster
+    pub fn client_get_file(
+        file_name: &str,
+        client_id: u64,
+        client_rx: Arc<Mutex<Receiver<Response>>>,
         network: Network,
-        peers: &[u64],
+        logger: &Logger,
+    ) -> Result<Vec<u8>> {
+        let queries: HashMap<u64, QueryMsg> = network
+            .lock()
+            .unwrap()
+            .peers()
+            .into_iter()
+            .map(|p| {
+                let query = QueryMsg::ReadFrags {
+                    from: client_id,
+                    file_name: file_name.to_string(),
+                };
+
+                (p, query)
+            })
+            .collect();
+
+        dbg!(&queries);
+        let queries = Arc::new(Mutex::new(queries));
+
+        let queries_clone = queries.clone();
+        thread::spawn(move || {
+            while !queries_clone.lock().unwrap().is_empty() {
+                for (to, query) in queries_clone.lock().unwrap().iter() {
+                    network
+                        .lock()
+                        .unwrap()
+                        .send_query_message(*to, query.clone());
+
+                    thread::sleep(DURATION_PER_PROPOSAL);
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+        });
+
+        let mut frags = HashMap::new();
+
+        while !queries.lock().unwrap().is_empty() {
+            let res = client_rx.lock().unwrap().recv_timeout(CLIENT_TIMEOUT);
+
+            assert!(
+                res.is_ok(),
+                "Client {client_id} waited too long for response"
+            );
+
+            let res = res.unwrap();
+            match res.msg {
+                ResponseMsg::Frags(f) => {
+                    info!(logger, "Client {client_id} got fragment response");
+
+                    assert_eq!(res.to, client_id);
+                    for frag in f.expect("Frags were not successfully recieved") {
+                        frags.insert(frag.get_file_idx(), frag);
+                    }
+
+                    queries.lock().unwrap().remove(&res.from);
+                }
+                _ => panic!("Incorrect response variant recieved"),
+            }
+        }
+
+        if frags.len() < 1 || frags.len() as u64 != frags[&0].get_total_frags() {
+            Err(Error::FileRetrievalError)
+        } else {
+            let mut frags: Vec<_> = frags.into_values().collect();
+            frags.sort_by_key(|f| f.file_idx);
+            Ok(frags.iter().flat_map(|f| f.data.clone()).collect())
+        }
+    }
+
+    fn cleanup(
+        client_handles: Option<Vec<JoinHandle<()>>>,
+        node_handles: Option<Vec<JoinHandle<Node>>>,
+        network: Network,
+        peers: Option<&[u64]>,
     ) {
-        for handle in client_handles {
-            handle.join().expect("handle could not be joined");
+        if let Some(client_handles) = client_handles {
+            for handle in client_handles {
+                handle.join().expect("handle could not be joined");
+            }
         }
 
-        for id in peers {
-            network
-                .lock()
-                .unwrap()
-                .send_control_message(*id, Signal::Shutdown);
+        if let Some(peers) = peers {
+            for id in peers {
+                network
+                    .lock()
+                    .unwrap()
+                    .send_control_message(*id, Signal::Shutdown);
+            }
         }
 
-        for handle in node_handles {
-            handle.join().expect("handle could not be joined");
+        if let Some(node_handles) = node_handles {
+            for handle in node_handles {
+                handle.join().expect("handle could not be joined");
+            }
         }
     }
 
@@ -342,7 +430,7 @@ mod test {
     #[test_case(1, 1, name = "single_node_1_client_simple")]
     #[test_case(1, 5, name = "single_node_5_client_simple")]
     #[test_case(5, 5, name = "five_node_5_client_simple")]
-    #[timeout(3000)]
+    #[timeout(5000)]
     fn simple(n_peers: u64, n_clients: u64) {
         in_temp_dir!({
             let peers: Vec<u64> = (1..=n_peers).collect();
@@ -356,9 +444,33 @@ mod test {
                 ..
             } = init_cluster(&peers, &clients, &logger);
 
-            let client_handles = spawn_clients(&clients, client_rxs, &logger, network.clone());
+            let client_handles =
+                spawn_clients(&clients, client_rxs.clone(), &logger, network.clone());
 
-            cleanup(client_handles, node_handles, network, &peers);
+            cleanup(Some(client_handles), None, network.clone(), None);
+
+            for c in clients {
+                let file = client_get_file(
+                    &c.to_string(),
+                    c,
+                    client_rxs[&c].clone(),
+                    network.clone(),
+                    &logger,
+                )
+                .expect("Could not get file");
+
+                info!(logger, "Got file for client {c} with contents: {file:?}");
+
+                assert_eq!(
+                    file,
+                    (0..N_PROPOSALS)
+                        .into_iter()
+                        .flat_map(|i| i.to_le_bytes())
+                        .collect::<Vec<_>>()
+                )
+            }
+
+            cleanup(None, Some(node_handles), network, Some(&peers));
         });
     }
 
@@ -385,7 +497,12 @@ mod test {
                 .unwrap()
                 .send_control_message(1, Signal::Shutdown);
 
-            cleanup(client_handles, node_handles, network, &peers);
+            cleanup(
+                Some(client_handles),
+                Some(node_handles),
+                network,
+                Some(&peers),
+            );
         });
     }
 
@@ -422,7 +539,12 @@ mod test {
 
             let node_handles = restore_cluster(&peers, &clients, &logger, network.clone());
 
-            cleanup(client_handles, node_handles, network, &peers);
+            cleanup(
+                Some(client_handles),
+                Some(node_handles),
+                network,
+                Some(&peers),
+            );
         });
     }
 }
