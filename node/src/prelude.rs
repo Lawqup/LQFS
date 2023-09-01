@@ -95,16 +95,3 @@ impl<T: Into<persy::PersyError>> From<persy::PE<T>> for Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
-
-pub trait MyInto<T> {
-    fn my_into(self) -> T;
-}
-
-impl<T, E> MyInto<Result<T>> for std::result::Result<T, E>
-where
-    E: Into<Error>,
-{
-    fn my_into(self) -> Result<T> {
-        self.map_err(|e| e.into())
-    }
-}
