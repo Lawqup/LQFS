@@ -18,13 +18,13 @@ use crate::{
 };
 
 pub struct InitResult {
-    network: Network,
-    client_rxs: HashMap<u64, Arc<Mutex<Receiver<Response>>>>,
-    node_handles: Vec<JoinHandle<Node>>,
+    pub network: Network,
+    pub client_rxs: HashMap<u64, Arc<Mutex<Receiver<Response>>>>,
+    pub node_handles: Vec<JoinHandle<Node>>,
 }
 
-fn init_cluster(peers: &[u64], clients: &[u64], logger: &Logger) -> InitResult {
-    let (network, mut client_rxs) = NetworkController::new(peers, clients, logger.clone());
+pub fn init_cluster(peers: &[u64], clients: &[u64], logger: &Logger) -> InitResult {
+    let (network, client_rxs) = NetworkController::new(peers, clients, logger.clone());
     let network = Arc::new(Mutex::new(network));
 
     let technician = clients.iter().max().copied().unwrap_or_default() + 1;
@@ -79,7 +79,6 @@ fn init_cluster(peers: &[u64], clients: &[u64], logger: &Logger) -> InitResult {
         thread::sleep(Duration::from_millis(200));
     }
 
-    client_rxs.remove(&technician);
     InitResult {
         network,
         client_rxs: client_rxs
@@ -91,25 +90,49 @@ fn init_cluster(peers: &[u64], clients: &[u64], logger: &Logger) -> InitResult {
 }
 
 /// Restores the cluster from persistent storage.
-/// At least the leader's data must have been initialized.
-pub fn restore_cluster(
+/// At least one node's data must have been initialized.
+pub fn try_restore_cluster(peers: &[u64], clients: &[u64], logger: &Logger) -> Result<InitResult> {
+    let (network, client_rxs) = NetworkController::new(peers, clients, logger.clone());
+    let network = Arc::new(Mutex::new(network));
+
+    Ok(InitResult {
+        network: network.clone(),
+        client_rxs: client_rxs
+            .into_iter()
+            .map(|(c, rx)| (c, Arc::new(Mutex::new(rx))))
+            .collect(),
+        node_handles: try_restore_cluster_with_network(peers, clients, logger, network)?,
+    })
+}
+
+fn try_restore_cluster_with_network(
     peers: &[u64],
     clients: &[u64],
     logger: &Logger,
     network: Network,
-) -> Vec<JoinHandle<Node>> {
+) -> Result<Vec<JoinHandle<Node>>> {
     let technician = clients.iter().max().copied().unwrap_or_default() + 1;
     let tech_rx = network.lock().unwrap().add_client(technician);
 
-    let mut node_handles = Vec::new();
+    let mut can_recover = false;
+    let mut nodes = Vec::new();
     for &id in peers.iter() {
-        let network = network.clone();
-        let logger = logger.clone();
+        nodes.push(match Node::try_restore(id, network.clone(), &logger) {
+            Ok(node) => {
+                can_recover = true;
+                node
+            }
+            Err(_) => Node::new_follower(id, network.clone(), &logger),
+        });
+    }
+
+    if !can_recover {
+        return Err(Error::InitError);
+    }
+
+    let mut node_handles = Vec::new();
+    for mut node in nodes {
         node_handles.push(thread::spawn(move || {
-            let mut node = match Node::try_restore(id, network.clone(), &logger) {
-                Ok(node) => node,
-                Err(_) => Node::new_follower(id, network, &logger),
-            };
             node.run();
             node
         }));
@@ -141,7 +164,7 @@ pub fn restore_cluster(
         thread::sleep(Duration::from_millis(200));
     }
 
-    node_handles
+    Ok(node_handles)
 }
 
 #[cfg(test)]
@@ -158,7 +181,7 @@ mod test {
     use raft::StateRole;
 
     use crate::{
-        cluster::{init_cluster, restore_cluster, InitResult},
+        cluster::{init_cluster, try_restore_cluster_with_network, InitResult},
         frag::fragment::Fragment,
         network::{Network, QueryMsg, RequestMsg, Response, ResponseMsg, Signal},
         prelude::*,
@@ -196,7 +219,6 @@ mod test {
                     data: i.to_le_bytes().to_vec(),
                     ..Default::default()
                 };
-                dbg!(&frag);
                 let prop = Proposal::new_fragment(client_id, frag);
                 (prop.id, prop)
             })
@@ -305,7 +327,6 @@ mod test {
             })
             .collect();
 
-        dbg!(&queries);
         let queries = Arc::new(Mutex::new(queries));
 
         let queries_clone = queries.clone();
@@ -360,9 +381,8 @@ mod test {
 
     fn cleanup(
         client_handles: Option<Vec<JoinHandle<()>>>,
-        node_handles: Option<Vec<JoinHandle<Node>>>,
+        nodes: Option<(&[u64], Vec<JoinHandle<Node>>)>,
         network: Network,
-        peers: Option<&[u64]>,
     ) {
         if let Some(client_handles) = client_handles {
             for handle in client_handles {
@@ -370,16 +390,14 @@ mod test {
             }
         }
 
-        if let Some(peers) = peers {
+        if let Some((peers, node_handles)) = nodes {
             for id in peers {
                 network
                     .lock()
                     .unwrap()
                     .send_control_message(*id, Signal::Shutdown);
             }
-        }
 
-        if let Some(node_handles) = node_handles {
             for handle in node_handles {
                 handle.join().expect("handle could not be joined");
             }
@@ -447,7 +465,7 @@ mod test {
             let client_handles =
                 spawn_clients(&clients, client_rxs.clone(), &logger, network.clone());
 
-            cleanup(Some(client_handles), None, network.clone(), None);
+            cleanup(Some(client_handles), None, network.clone());
 
             for c in clients {
                 let file = client_get_file(
@@ -470,7 +488,7 @@ mod test {
                 )
             }
 
-            cleanup(None, Some(node_handles), network, Some(&peers));
+            cleanup(None, Some((&peers, node_handles)), network);
         });
     }
 
@@ -497,12 +515,7 @@ mod test {
                 .unwrap()
                 .send_control_message(1, Signal::Shutdown);
 
-            cleanup(
-                Some(client_handles),
-                Some(node_handles),
-                network,
-                Some(&peers),
-            );
+            cleanup(Some(client_handles), Some((&peers, node_handles)), network);
         });
     }
 
@@ -523,28 +536,17 @@ mod test {
             } = init_cluster(&peers, &clients, &logger);
 
             let client_handles = spawn_clients(&clients, client_rxs, &logger, network.clone());
+            thread::sleep(Duration::from_millis(100));
 
-            for id in peers.clone() {
-                network
-                    .lock()
-                    .unwrap()
-                    .send_control_message(id, Signal::Shutdown);
-            }
-
-            for handle in node_handles {
-                handle.join().expect("handle could not be joined");
-            }
+            cleanup(None, Some((&peers, node_handles)), network.clone());
 
             debug!(logger, "ALL NODES SHUTDOWN");
 
-            let node_handles = restore_cluster(&peers, &clients, &logger, network.clone());
+            let node_handles =
+                try_restore_cluster_with_network(&peers, &clients, &logger, network.clone())
+                    .unwrap();
 
-            cleanup(
-                Some(client_handles),
-                Some(node_handles),
-                network,
-                Some(&peers),
-            );
+            cleanup(Some(client_handles), Some((&peers, node_handles)), network);
         });
     }
 }

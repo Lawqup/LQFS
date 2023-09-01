@@ -333,7 +333,9 @@ impl Node {
     }
 
     fn handle_commited_entries(&mut self, entries: Vec<Entry>) {
+        let mut last_apply_index = 0;
         for entry in entries {
+            last_apply_index = entry.index;
             if entry.data.is_empty() {
                 continue;
             }
@@ -343,7 +345,7 @@ impl Node {
                 EntryType::EntryNormal => {
                     let fragment = Fragment::parse_from_bytes(entry.get_data()).unwrap();
 
-                    self.fs.apply(fragment);
+                    self.fs.apply(fragment).unwrap();
                     info!(self.logger, "Applied fragment proposal from {prop_from}");
                 }
                 EntryType::EntryConfChange => {
@@ -376,5 +378,7 @@ impl Node {
                 }
             }
         }
+
+        self.raft_mut().store().compact(last_apply_index).unwrap();
     }
 }

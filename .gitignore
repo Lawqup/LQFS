@@ -21,3 +21,6 @@ Cargo.lock
 # NPM moment
 client/node_modules
 client/package-lock.json
+
+# Data stores
+node/store
