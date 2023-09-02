@@ -1,11 +1,8 @@
 #![allow(dead_code)]
 
-use std::{thread, time::Duration};
-
-use cluster::{try_restore_cluster, InitResult};
+use cluster::InitResult;
 use network::Signal;
 use prelude::*;
-use raft::StateRole;
 
 mod cluster;
 mod frag;
@@ -24,10 +21,8 @@ fn main() {
         network,
         node_handles,
         ..
-    } = match cluster::try_restore_cluster(&peers, &[], &logger) {
-        Ok(res) => res,
-        Err(_) => cluster::init_cluster(&peers, &[], &logger),
-    };
+    } = cluster::try_restore_cluster(&peers, &[], &logger)
+        .unwrap_or_else(|_| cluster::init_cluster(&peers, &[], &logger));
 
     for id in peers {
         network

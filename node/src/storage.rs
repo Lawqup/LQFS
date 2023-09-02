@@ -536,10 +536,6 @@ mod test {
         }
     }
 
-    fn size_of<T: PbMessage>(m: &T) -> u32 {
-        m.compute_size()
-    }
-
     fn new_snapshot(index: u64, term: u64, voters: Vec<u64>) -> Snapshot {
         let mut s = Snapshot::default();
         s.mut_metadata().index = index;
@@ -603,26 +599,30 @@ mod test {
             (
                 4,
                 7,
-                u64::from(size_of(&ents[1]) + size_of(&ents[2])),
+                u64::from(ents[1].compute_size() + ents[2].compute_size()),
                 Ok(vec![new_entry(4, 4), new_entry(5, 5)]),
             ),
             (
                 4,
                 7,
-                u64::from(size_of(&ents[1]) + size_of(&ents[2]) + size_of(&ents[3]) / 2),
+                u64::from(
+                    ents[1].compute_size() + ents[2].compute_size() + ents[3].compute_size() / 2,
+                ),
                 Ok(vec![new_entry(4, 4), new_entry(5, 5)]),
             ),
             (
                 4,
                 7,
-                u64::from(size_of(&ents[1]) + size_of(&ents[2]) + size_of(&ents[3]) - 1),
+                u64::from(
+                    ents[1].compute_size() + ents[2].compute_size() + ents[3].compute_size() - 1,
+                ),
                 Ok(vec![new_entry(4, 4), new_entry(5, 5)]),
             ),
             // all
             (
                 4,
                 7,
-                u64::from(size_of(&ents[1]) + size_of(&ents[2]) + size_of(&ents[3])),
+                u64::from(ents[1].compute_size() + ents[2].compute_size() + ents[3].compute_size()),
                 Ok(vec![new_entry(4, 4), new_entry(5, 5), new_entry(6, 6)]),
             ),
         ];

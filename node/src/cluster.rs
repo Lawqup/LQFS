@@ -8,7 +8,7 @@ use std::{
 use slog::Logger;
 
 use crate::{
-    network::{self, QueryMsg, ResponseMsg},
+    network::{QueryMsg, ResponseMsg},
     prelude::*,
 };
 
@@ -117,12 +117,12 @@ fn try_restore_cluster_with_network(
     let mut can_recover = false;
     let mut nodes = Vec::new();
     for &id in peers.iter() {
-        nodes.push(match Node::try_restore(id, network.clone(), &logger) {
+        nodes.push(match Node::try_restore(id, network.clone(), logger) {
             Ok(node) => {
                 can_recover = true;
                 node
             }
-            Err(_) => Node::new_follower(id, network.clone(), &logger),
+            Err(_) => Node::new_follower(id, network.clone(), logger),
         });
     }
 
@@ -370,7 +370,7 @@ mod test {
             }
         }
 
-        if frags.len() < 1 || frags.len() as u64 != frags[&0].get_total_frags() {
+        if frags.is_empty() || frags.len() as u64 != frags[&0].get_total_frags() {
             Err(Error::FileRetrievalError)
         } else {
             let mut frags: Vec<_> = frags.into_values().collect();
@@ -482,7 +482,6 @@ mod test {
                 assert_eq!(
                     file,
                     (0..N_PROPOSALS)
-                        .into_iter()
                         .flat_map(|i| i.to_le_bytes())
                         .collect::<Vec<_>>()
                 )

@@ -53,15 +53,17 @@ impl Node {
         let logger = logger.new(o!("tag" => format!("node_{id}")));
 
         info!(logger, "RESTORING");
-        let mut config = Self::config();
-        config.id = id;
-        config.validate().expect("Raft config should be valid");
 
         let path = &format!("store/node-{id}/");
         let path = Path::new(path);
 
         path.exists().then_some(()).ok_or(Error::InitError)?;
         let storage = NodeStorage::restore(id).expect("Could not restore node storage");
+
+        let mut config = Self::config();
+        config.id = id;
+        config.applied = storage.first_index()?.saturating_sub(1);
+        config.validate().expect("Raft config should be valid");
 
         let raft = Some(RawNode::new(&config, storage, &logger).unwrap());
 
@@ -335,7 +337,7 @@ impl Node {
     fn handle_commited_entries(&mut self, entries: Vec<Entry>) {
         let mut last_apply_index = 0;
         for entry in entries {
-            last_apply_index = entry.index;
+            last_apply_index = std::cmp::max(last_apply_index, entry.index);
             if entry.data.is_empty() {
                 continue;
             }
