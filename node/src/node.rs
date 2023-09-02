@@ -1,7 +1,7 @@
 //! Defines the node struct and provides its APIs
+use prost::Message as PRMessage;
 use raft::{prelude::*, Config, RawNode, StateRole};
 
-use protobuf::Message as PbMessage;
 use std::{
     collections::VecDeque,
     fs,
@@ -11,7 +11,7 @@ use std::{
 };
 
 use crate::{
-    frag::{fragment::Fragment, FSManager},
+    frag::{FSManager, Fragment},
     network::{Network, QueryMsg, RequestMsg, Response, ResponseMsg, Signal},
     prelude::*,
     storage::{LogStore, NodeStorage},
@@ -129,7 +129,7 @@ impl Node {
     }
 
     pub fn init_from_message(&mut self, msg: &Message) -> Result<()> {
-        match msg.msg_type {
+        match MessageType::from_i32(msg.msg_type.into()).unwrap() {
             MessageType::MsgRequestVote | MessageType::MsgRequestPreVote => {}
             MessageType::MsgHeartbeat if msg.commit == 0 => {}
             _ => return Err(Error::InitError),
@@ -216,7 +216,7 @@ impl Node {
                 if let Some(follower) = self.followers_to_add.get(0) {
                     let conf_change = ConfChange {
                         node_id: *follower,
-                        change_type: ConfChangeType::AddNode,
+                        change_type: ConfChangeType::AddNode.into(),
                         ..Default::default()
                     };
 
@@ -241,7 +241,7 @@ impl Node {
         let index_before = self.raft_mut().raft.raft_log.last_index();
         let ctx = prop.context_bytes();
         if let Some(frag) = &prop.fragment {
-            let bytes = frag.write_to_bytes().unwrap();
+            let bytes = frag.encode_to_vec();
             let _ = self.raft_mut().propose(ctx, bytes);
         } else if let Some(cc) = &prop.conf_change {
             let _ = self.raft_mut().propose_conf_change(ctx, cc.clone());
@@ -345,7 +345,7 @@ impl Node {
             let (prop_id, prop_from) = Proposal::context_from_bytes(entry.get_context());
             match entry.get_entry_type() {
                 EntryType::EntryNormal => {
-                    let fragment = Fragment::parse_from_bytes(entry.get_data()).unwrap();
+                    let fragment = Fragment::decode(entry.get_data()).unwrap();
 
                     self.fs.apply(fragment).unwrap();
                     info!(self.logger, "Applied fragment proposal from {prop_from}");
@@ -354,7 +354,7 @@ impl Node {
                     info!(self.logger, "Applied ConfChange proposal from {prop_from}");
 
                     let mut cc = ConfChange::default();
-                    cc.merge_from_bytes(&entry.data).unwrap();
+                    cc.merge(entry.data.as_slice()).unwrap();
                     let cs = self.raft_mut().apply_conf_change(&cc).unwrap();
                     self.raft_mut()
                         .store()

@@ -1,7 +1,7 @@
 use std::{cmp::Ordering, sync::Arc};
 
 use persy::{ByteVec, Persy, Transaction, TxIndexIter, ValueMode};
-use protobuf::Message;
+use prost::Message as PRMessage;
 use raft::{prelude::*, Storage};
 
 use crate::prelude::Result;
@@ -55,7 +55,7 @@ impl NodeStorageCore {
         tx.put::<String, ByteVec>(
             METADATA_INDEX,
             HARD_STATE_KEY.to_string(),
-            hard_state.write_to_bytes()?.into(),
+            hard_state.encode_to_vec().into(),
         )?;
 
         Ok(())
@@ -67,7 +67,7 @@ impl NodeStorageCore {
         tx.put::<String, ByteVec>(
             METADATA_INDEX,
             CONF_STATE_KEY.to_string(),
-            conf_state.write_to_bytes()?.into(),
+            conf_state.encode_to_vec().into(),
         )?;
 
         Ok(())
@@ -83,7 +83,7 @@ impl NodeStorageCore {
         tx.put::<String, ByteVec>(
             METADATA_INDEX,
             SNAPSHOT_METADATA_KEY.to_string(),
-            metadata.write_to_bytes()?.into(),
+            metadata.encode_to_vec().into(),
         )?;
 
         Ok(())
@@ -118,7 +118,7 @@ impl NodeStorageCore {
 
         for entry in entries {
             let index = entry.index;
-            tx.put::<u64, ByteVec>(ENTRIES_INDEX, index, entry.write_to_bytes()?.into())?;
+            tx.put::<u64, ByteVec>(ENTRIES_INDEX, index, entry.encode_to_vec().into())?;
         }
 
         Ok(())
@@ -130,7 +130,7 @@ impl NodeStorageCore {
             .next()
             .unwrap();
 
-        Ok(HardState::parse_from_bytes(data)?)
+        Ok(HardState::decode(data.to_vec().as_slice())?)
     }
 
     pub fn get_conf_state(&self, tx: &mut Transaction) -> Result<ConfState> {
@@ -139,7 +139,7 @@ impl NodeStorageCore {
             .next()
             .unwrap();
 
-        Ok(ConfState::parse_from_bytes(data)?)
+        Ok(ConfState::decode(data.to_vec().as_slice())?)
     }
 
     pub fn get_snapshot_metadata(&self, tx: &mut Transaction) -> Result<SnapshotMetadata> {
@@ -148,7 +148,7 @@ impl NodeStorageCore {
             .next()
             .unwrap();
 
-        Ok(SnapshotMetadata::parse_from_bytes(data)?)
+        Ok(SnapshotMetadata::decode(data.to_vec().as_slice())?)
     }
 
     pub fn get_snapshot(&self, tx: &mut Transaction) -> Result<Snapshot> {
@@ -176,7 +176,7 @@ impl NodeStorageCore {
         let iter: TxIndexIter<u64, ByteVec> = tx.range(ENTRIES_INDEX, ..)?;
 
         if let Some(mut e) = iter.last() {
-            let e = Entry::parse_from_bytes(&e.1.next().unwrap())
+            let e = Entry::decode(e.1.next().unwrap().to_vec().as_slice())
                 .expect("Entry bytes should not be malformed.");
 
             Ok(e.index)
@@ -189,7 +189,7 @@ impl NodeStorageCore {
         let mut iter: TxIndexIter<u64, ByteVec> = tx.range(ENTRIES_INDEX, ..)?;
 
         if let Some(mut e) = iter.next() {
-            let e = Entry::parse_from_bytes(&e.1.next().unwrap())
+            let e = Entry::decode(e.1.next().unwrap().to_vec().as_slice())
                 .expect("Entry bytes should not be malformed.");
 
             Ok(e.index)
@@ -214,10 +214,10 @@ impl NodeStorageCore {
         let mut res = Vec::new();
 
         for (i, (_, mut e)) in iter.enumerate() {
-            let entry = Entry::parse_from_bytes(&e.next().unwrap())
+            let entry = Entry::decode(e.next().unwrap().to_vec().as_slice())
                 .expect("Entry bytes should not be malformed.");
 
-            total_bytes += entry.compute_size() as u64;
+            total_bytes += entry.encoded_len() as u64;
 
             if max_size.is_some_and(|max_size| total_bytes > max_size) && i != 0 {
                 break;
@@ -235,7 +235,7 @@ impl NodeStorageCore {
             .next()
             .ok_or(raft::Error::Store(raft::StorageError::Unavailable))?;
 
-        Ok(Entry::parse_from_bytes(&data)?)
+        Ok(Entry::decode(data.to_vec().as_slice())?)
     }
 
     #[cfg(test)]
@@ -246,7 +246,7 @@ impl NodeStorageCore {
 
         for entry in entries {
             let index = entry.index;
-            tx.put::<u64, ByteVec>(ENTRIES_INDEX, index, entry.write_to_bytes()?.into())?;
+            tx.put::<u64, ByteVec>(ENTRIES_INDEX, index, entry.encode_to_vec().into())?;
         }
 
         tx.prepare()?.commit()?;
@@ -504,7 +504,7 @@ impl LogStore for NodeStorage {
 
 #[cfg(test)]
 mod test {
-    use protobuf::Message as PbMessage;
+    use prost::Message as PRMessage;
     use raft::prelude::*;
     use raft::Error as RaftError;
     use raft::GetEntriesContext;
@@ -599,30 +599,26 @@ mod test {
             (
                 4,
                 7,
-                u64::from(ents[1].compute_size() + ents[2].compute_size()),
+                (ents[1].encoded_len() + ents[2].encoded_len()) as u64,
                 Ok(vec![new_entry(4, 4), new_entry(5, 5)]),
             ),
             (
                 4,
                 7,
-                u64::from(
-                    ents[1].compute_size() + ents[2].compute_size() + ents[3].compute_size() / 2,
-                ),
+                (ents[1].encoded_len() + ents[2].encoded_len() + ents[3].encoded_len() / 2) as u64,
                 Ok(vec![new_entry(4, 4), new_entry(5, 5)]),
             ),
             (
                 4,
                 7,
-                u64::from(
-                    ents[1].compute_size() + ents[2].compute_size() + ents[3].compute_size() - 1,
-                ),
+                (ents[1].encoded_len() + ents[2].encoded_len() + ents[3].encoded_len() - 1) as u64,
                 Ok(vec![new_entry(4, 4), new_entry(5, 5)]),
             ),
             // all
             (
                 4,
                 7,
-                u64::from(ents[1].compute_size() + ents[2].compute_size() + ents[3].compute_size()),
+                (ents[1].encoded_len() + ents[2].encoded_len() + ents[3].encoded_len()) as u64,
                 Ok(vec![new_entry(4, 4), new_entry(5, 5), new_entry(6, 6)]),
             ),
         ];

@@ -1,6 +1,6 @@
 //! Deals with the global state across nodes
 
-use crate::{frag::fragment::Fragment, prelude::*};
+use crate::{frag::Fragment, prelude::*};
 use raft::prelude::Message;
 use uuid::Uuid;
 

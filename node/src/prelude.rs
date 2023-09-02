@@ -1,12 +1,11 @@
 use std::sync::Mutex;
 
-use protobuf::ProtobufError;
 use raft::prelude::ConfChange;
 pub use slog::{debug, error, info, o, Drain, Logger};
 use thiserror::Error as ThisError;
 pub use uuid::Uuid;
 
-use crate::frag::fragment::Fragment;
+use crate::frag::Fragment;
 
 #[derive(Clone, Debug)]
 pub struct Proposal {
@@ -74,8 +73,10 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("database error: `{0}`")]
     Database(#[from] persy::PersyError),
-    #[error("serialization error: `{0}`")]
-    SerialError(#[from] ProtobufError),
+    #[error("decode error: `{0}`")]
+    DecodeError(#[from] prost::DecodeError),
+    #[error("encode error: `{0}`")]
+    EncodeError(#[from] prost::EncodeError),
     #[error("unkown error: `{0}`")]
     Other(#[source] Box<dyn std::error::Error + Sync + Send + 'static>),
     #[error("conversion error")]

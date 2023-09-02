@@ -3,6 +3,7 @@
 use cluster::InitResult;
 use network::Signal;
 use prelude::*;
+use service::ReadFragsRequest;
 
 mod cluster;
 mod frag;
@@ -11,9 +12,15 @@ mod node;
 mod prelude;
 mod storage;
 
+pub mod service {
+    tonic::include_proto!("service");
+}
+
 const N_PEERS: u64 = 3;
 
 fn main() {
+    // let addr = "[::1]:50051".parse().unwrap();
+
     let peers: Vec<u64> = (1..=N_PEERS).collect();
     let logger = build_default_logger();
 

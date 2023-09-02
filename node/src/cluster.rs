@@ -182,7 +182,7 @@ mod test {
 
     use crate::{
         cluster::{init_cluster, try_restore_cluster_with_network, InitResult},
-        frag::fragment::Fragment,
+        frag::Fragment,
         network::{Network, QueryMsg, RequestMsg, Response, ResponseMsg, Signal},
         prelude::*,
     };
@@ -361,7 +361,7 @@ mod test {
 
                     assert_eq!(res.to, client_id);
                     for frag in f.expect("Frags were not successfully recieved") {
-                        frags.insert(frag.get_file_idx(), frag);
+                        frags.insert(frag.file_idx, frag);
                     }
 
                     queries.lock().unwrap().remove(&res.from);
@@ -370,7 +370,7 @@ mod test {
             }
         }
 
-        if frags.is_empty() || frags.len() as u64 != frags[&0].get_total_frags() {
+        if frags.is_empty() || frags.len() as u64 != frags[&0].total_frags {
             Err(Error::FileRetrievalError)
         } else {
             let mut frags: Vec<_> = frags.into_values().collect();

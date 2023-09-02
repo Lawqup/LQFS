@@ -7,9 +7,7 @@ use std::{
 
 use crate::prelude::*;
 
-use self::fragment::Fragment;
-
-include!(concat!(env!("OUT_DIR"), "/protos/mod.rs"));
+tonic::include_proto!("fragment");
 
 pub struct FSManager {
     dir: PathBuf,
