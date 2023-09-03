@@ -1,13 +1,16 @@
 use std::{
-    collections::{HashMap, HashSet},
-    sync::{mpsc::Receiver, Arc, Mutex},
-    thread::{self, JoinHandle},
+    collections::HashSet,
+    sync::Arc,
+    thread::{self},
     time::Duration,
 };
 
 use slog::Logger;
 
-use tokio::task;
+use tokio::{
+    sync::Mutex,
+    task::{self, JoinHandle},
+};
 
 use crate::{
     network::{QueryMsg, ResponseMsg},
@@ -15,7 +18,7 @@ use crate::{
 };
 
 use crate::{
-    network::{Network, NetworkController, Response},
+    network::{Network, NetworkController},
     node::Node,
 };
 
@@ -29,16 +32,16 @@ pub async fn init_cluster(peers: &[u64], clients: &[u64], logger: &Logger) -> In
     let network = Arc::new(Mutex::new(network));
 
     let technician = clients.iter().max().copied().unwrap_or_default() + 1;
-    network.lock().unwrap().add_client(technician).await;
+    network.lock().await.add_client(technician).await;
 
     let mut node_handles = Vec::new();
     for &id in peers.iter().skip(1) {
         let network = network.clone();
         let logger = logger.clone();
-        node_handles.push(thread::spawn(move || {
+        node_handles.push(task::spawn(async move {
             info!(&logger, "Starting follower (id: {id})");
             let mut node = Node::new_follower(id, network, &logger);
-            node.run();
+            node.run().await;
             node
         }));
     }
@@ -47,10 +50,10 @@ pub async fn init_cluster(peers: &[u64], clients: &[u64], logger: &Logger) -> In
 
     let logger_clone = logger.clone();
     let network_clone = network.clone();
-    node_handles.push(thread::spawn(move || {
+    node_handles.push(task::spawn(async move {
         info!(logger_clone, "Starting leader (id: {leader_id})");
-        let mut leader = Node::new_leader(leader_id, network_clone, &logger_clone);
-        leader.run();
+        let mut leader = Node::new_leader(leader_id, network_clone, &logger_clone).await;
+        leader.run().await;
         leader
     }));
 
@@ -61,12 +64,13 @@ pub async fn init_cluster(peers: &[u64], clients: &[u64], logger: &Logger) -> In
         for node in still_uninit.iter().copied() {
             network
                 .lock()
-                .unwrap()
-                .send_query_message(node, QueryMsg::IsInitialized { from: technician });
+                .await
+                .send_query_message(node, QueryMsg::IsInitialized { from: technician })
+                .await;
 
             match network
                 .lock()
-                .unwrap()
+                .await
                 .get_client_receiver(technician)
                 .recv()
                 .await
@@ -118,7 +122,7 @@ async fn try_restore_cluster_with_network(
     network: Network,
 ) -> Result<Vec<JoinHandle<Node>>> {
     let technician = clients.iter().max().copied().unwrap_or_default() + 1;
-    network.lock().unwrap().add_client(technician);
+    network.lock().await.add_client(technician).await;
 
     let mut can_recover = false;
     let mut nodes = Vec::new();
@@ -138,8 +142,8 @@ async fn try_restore_cluster_with_network(
 
     let mut node_handles = Vec::new();
     for mut node in nodes {
-        node_handles.push(thread::spawn(move || {
-            node.run();
+        node_handles.push(task::spawn(async move {
+            node.run().await;
             node
         }));
     }
@@ -151,12 +155,13 @@ async fn try_restore_cluster_with_network(
         for node in still_uninit.iter().copied() {
             network
                 .lock()
-                .unwrap()
-                .send_query_message(node, QueryMsg::IsInitialized { from: technician });
+                .await
+                .send_query_message(node, QueryMsg::IsInitialized { from: technician })
+                .await;
 
             match network
                 .lock()
-                .unwrap()
+                .await
                 .get_client_receiver(technician)
                 .recv()
                 .await
@@ -187,12 +192,15 @@ mod test {
     use std::{
         collections::HashMap,
         env, fs,
-        sync::{mpsc::Receiver, Arc, Mutex},
-        thread::{self, JoinHandle},
-        time::Duration,
+        sync::Arc,
+        thread,
+        time::{Duration, Instant},
     };
 
-    use tokio::task;
+    use tokio::{
+        runtime::Runtime,
+        task::{self, JoinHandle},
+    };
 
     use ntest::{test_case, timeout};
     use raft::StateRole;
@@ -200,7 +208,7 @@ mod test {
     use crate::{
         cluster::{init_cluster, try_restore_cluster_with_network, InitResult},
         frag::Fragment,
-        network::{Network, QueryMsg, RequestMsg, Response, ResponseMsg, Signal},
+        network::{Network, QueryMsg, RequestMsg, ResponseMsg, Signal},
         prelude::*,
     };
 
@@ -216,14 +224,13 @@ mod test {
             env::set_current_dir(&tmpdir).unwrap();
             fs::create_dir("store").unwrap();
 
-            $block;
+            Runtime::new().unwrap().block_on(async $block);
         };
     }
 
     fn spawn_client(
         client_id: u64,
         n_proposals: usize,
-        client_rx: Arc<Mutex<Receiver<Response>>>,
         logger: Logger,
         network: Network,
     ) -> JoinHandle<()> {
@@ -241,22 +248,22 @@ mod test {
             })
             .collect();
 
-        let proposals = Arc::new(Mutex::new(proposals));
+        let proposals = Arc::new(tokio::sync::Mutex::new(proposals));
 
         let proposals_clone = proposals.clone();
         let logger_clone = logger.clone();
-        task::spawn(async {
-            while !proposals_clone.lock().unwrap().is_empty() {
+        let network_clone = network.clone();
+        task::spawn(async move {
+            while !proposals_clone.lock().await.is_empty() {
                 debug!(
                     logger_clone,
                     "{} PROPOSALS LEFT",
-                    proposals_clone.lock().unwrap().len()
+                    proposals_clone.lock().await.len()
                 );
 
-                let props = proposals_clone.lock().unwrap().values();
-                for prop in props {
+                for prop in proposals_clone.lock().await.values() {
                     info!(logger_clone, "CLIENT proposal ({}, {})", prop.id, prop.from);
-                    for tx in network.lock().unwrap().raft_senders.values() {
+                    for tx in network_clone.lock().await.raft_senders.values() {
                         tx.send(RequestMsg::Propose(prop.clone())).await.unwrap();
                     }
                     thread::sleep(DURATION_PER_PROPOSAL);
@@ -265,12 +272,23 @@ mod test {
             }
         });
 
-        thread::spawn(move || {
-            while !proposals.lock().unwrap().is_empty() {
-                let res = client_rx.lock().unwrap().recv_timeout(CLIENT_TIMEOUT);
+        task::spawn(async move {
+            while !proposals.lock().await.is_empty() {
+                let now = Instant::now();
+                let mut res = None;
+                while now.elapsed() < CLIENT_TIMEOUT {
+                    if let Ok(r) = network
+                        .lock()
+                        .await
+                        .get_client_receiver(client_id)
+                        .try_recv()
+                    {
+                        res = Some(r)
+                    }
+                }
 
                 assert!(
-                    res.is_ok(),
+                    res.is_some(),
                     "Client {client_id} waited too long for response"
                 );
 
@@ -282,7 +300,7 @@ mod test {
                     } => {
                         proposals
                             .lock()
-                            .unwrap()
+                            .await
                             .remove(&proposal_id)
                             .expect("Proposal didn't exist in the queue.");
 
@@ -301,18 +319,12 @@ mod test {
         })
     }
 
-    fn spawn_clients(
-        clients: &[u64],
-        mut client_rxs: HashMap<u64, Arc<Mutex<Receiver<Response>>>>,
-        logger: &Logger,
-        network: Network,
-    ) -> Vec<JoinHandle<()>> {
+    fn spawn_clients(clients: &[u64], logger: &Logger, network: Network) -> Vec<JoinHandle<()>> {
         let mut client_handles = Vec::new();
         for &client_id in clients {
             client_handles.push(spawn_client(
                 client_id,
                 N_PROPOSALS,
-                client_rxs.remove(&client_id).unwrap(),
                 logger.clone(),
                 network.clone(),
             ));
@@ -323,16 +335,15 @@ mod test {
 
     /// As a client, attempts to get and recombine an entire file
     /// by querying the whole cluster
-    pub fn client_get_file(
+    pub async fn client_get_file(
         file_name: &str,
         client_id: u64,
-        client_rx: Arc<Mutex<Receiver<Response>>>,
         network: Network,
         logger: &Logger,
     ) -> Result<Vec<u8>> {
         let queries: HashMap<u64, QueryMsg> = network
             .lock()
-            .unwrap()
+            .await
             .peers()
             .into_iter()
             .map(|p| {
@@ -345,15 +356,16 @@ mod test {
             })
             .collect();
 
-        let queries = Arc::new(Mutex::new(queries));
+        let queries = Arc::new(tokio::sync::Mutex::new(queries));
 
         let queries_clone = queries.clone();
-        thread::spawn(move || {
-            while !queries_clone.lock().unwrap().is_empty() {
-                for (to, query) in queries_clone.lock().unwrap().iter() {
-                    network
+        let network_clone = network.clone();
+        task::spawn(async move {
+            while !queries_clone.lock().await.is_empty() {
+                for (to, query) in queries_clone.lock().await.iter() {
+                    network_clone
                         .lock()
-                        .unwrap()
+                        .await
                         .send_query_message(*to, query.clone());
 
                     thread::sleep(DURATION_PER_PROPOSAL);
@@ -364,11 +376,22 @@ mod test {
 
         let mut frags = HashMap::new();
 
-        while !queries.lock().unwrap().is_empty() {
-            let res = client_rx.lock().unwrap().recv_timeout(CLIENT_TIMEOUT);
+        while !queries.lock().await.is_empty() {
+            let now = Instant::now();
+            let mut res = None;
+            while now.elapsed() < CLIENT_TIMEOUT {
+                if let Ok(r) = network
+                    .lock()
+                    .await
+                    .get_client_receiver(client_id)
+                    .try_recv()
+                {
+                    res = Some(r)
+                }
+            }
 
             assert!(
-                res.is_ok(),
+                res.is_some(),
                 "Client {client_id} waited too long for response"
             );
 
@@ -378,11 +401,11 @@ mod test {
                     info!(logger, "Client {client_id} got fragment response");
 
                     assert_eq!(res.to, client_id);
-                    for frag in f.expect("Frags were not successfully recieved") {
+                    for frag in f {
                         frags.insert(frag.file_idx, frag);
                     }
 
-                    queries.lock().unwrap().remove(&res.from);
+                    queries.lock().await.remove(&res.from);
                 }
                 _ => panic!("Incorrect response variant recieved"),
             }
@@ -397,14 +420,14 @@ mod test {
         }
     }
 
-    fn cleanup(
+    async fn cleanup(
         client_handles: Option<Vec<JoinHandle<()>>>,
         nodes: Option<(&[u64], Vec<JoinHandle<Node>>)>,
         network: Network,
     ) {
         if let Some(client_handles) = client_handles {
             for handle in client_handles {
-                handle.join().expect("handle could not be joined");
+                handle.await;
             }
         }
 
@@ -412,12 +435,13 @@ mod test {
             for id in peers {
                 network
                     .lock()
-                    .unwrap()
-                    .send_control_message(*id, Signal::Shutdown);
+                    .await
+                    .send_control_message(*id, Signal::Shutdown)
+                    .await;
             }
 
             for handle in node_handles {
-                handle.join().expect("handle could not be joined");
+                handle.await;
             }
         }
     }
@@ -435,19 +459,20 @@ mod test {
                 network,
                 node_handles,
                 ..
-            } = init_cluster(&peers, &[], &logger);
+            } = init_cluster(&peers, &[], &logger).await;
 
             for id in peers.clone() {
                 network
                     .lock()
-                    .unwrap()
-                    .send_control_message(id, Signal::Shutdown);
+                    .await
+                    .send_control_message(id, Signal::Shutdown)
+                    .await;
             }
 
             let mut n_leaders = 0;
             let mut n_followers = 0;
             for handle in node_handles {
-                let node = handle.join().expect("Handle could not be joined");
+                let node = handle.await.expect("Handle could not be joined");
 
                 assert!(node.raft.is_some());
 
@@ -476,24 +501,17 @@ mod test {
             let InitResult {
                 network,
                 node_handles,
-                client_rxs,
                 ..
-            } = init_cluster(&peers, &clients, &logger);
+            } = init_cluster(&peers, &clients, &logger).await;
 
-            let client_handles =
-                spawn_clients(&clients, client_rxs.clone(), &logger, network.clone());
+            let client_handles = spawn_clients(&clients, &logger, network.clone());
 
             cleanup(Some(client_handles), None, network.clone());
 
             for c in clients {
-                let file = client_get_file(
-                    &c.to_string(),
-                    c,
-                    client_rxs[&c].clone(),
-                    network.clone(),
-                    &logger,
-                )
-                .expect("Could not get file");
+                let file = client_get_file(&c.to_string(), c, network.clone(), &logger)
+                    .await
+                    .expect("Could not get file");
 
                 info!(logger, "Got file for client {c} with contents: {file:?}");
 
@@ -521,15 +539,14 @@ mod test {
             let InitResult {
                 network,
                 node_handles,
-                client_rxs,
                 ..
-            } = init_cluster(&peers, &clients, &logger);
+            } = init_cluster(&peers, &clients, &logger).await;
 
-            let client_handles = spawn_clients(&clients, client_rxs, &logger, network.clone());
+            let client_handles = spawn_clients(&clients, &logger, network.clone());
 
             network
                 .lock()
-                .unwrap()
+                .await
                 .send_control_message(1, Signal::Shutdown);
 
             cleanup(Some(client_handles), Some((&peers, node_handles)), network);
@@ -548,11 +565,10 @@ mod test {
             let InitResult {
                 network,
                 node_handles,
-                client_rxs,
                 ..
-            } = init_cluster(&peers, &clients, &logger);
+            } = init_cluster(&peers, &clients, &logger).await;
 
-            let client_handles = spawn_clients(&clients, client_rxs, &logger, network.clone());
+            let client_handles = spawn_clients(&clients, &logger, network.clone());
             thread::sleep(Duration::from_millis(100));
 
             cleanup(None, Some((&peers, node_handles)), network.clone());
@@ -561,6 +577,7 @@ mod test {
 
             let node_handles =
                 try_restore_cluster_with_network(&peers, &clients, &logger, network.clone())
+                    .await
                     .unwrap();
 
             cleanup(Some(client_handles), Some((&peers, node_handles)), network);

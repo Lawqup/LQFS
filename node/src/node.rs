@@ -78,7 +78,7 @@ impl Node {
         })
     }
 
-    pub fn new_leader(id: u64, network: Network, logger: &Logger) -> Self {
+    pub async fn new_leader(id: u64, network: Network, logger: &Logger) -> Self {
         let mut config = Self::config();
         config.id = id;
         config.validate().expect("Raft config should be valid");
@@ -98,7 +98,7 @@ impl Node {
 
         let mut followers_to_add = VecDeque::new();
 
-        for peer in network.lock().unwrap().peers() {
+        for peer in network.lock().await.peers() {
             if peer != id {
                 followers_to_add.push_front(peer);
             }
@@ -164,7 +164,7 @@ impl Node {
             // Keep recieving until there's nothing ready yet,
             // in which case stop recieving to drive the raft
             loop {
-                let mut network = network_clone.lock().unwrap();
+                let mut network = network_clone.lock().await;
                 match network.get_node_reciever(self.id).try_recv() {
                     Ok(RequestMsg::Raft(m)) => {
                         info!(self.logger, "Recieved raft message {m:?}");
@@ -173,24 +173,28 @@ impl Node {
                     Ok(RequestMsg::Propose(p)) => {
                         if self.is_leader() {
                             info!(self.logger, "Recieved proposal from {}", p.from);
-                            self.propose(&p);
+                            self.propose(&p).await;
                         }
                     }
                     Ok(RequestMsg::Query(q)) => match q {
                         QueryMsg::IsInitialized { from } => {
-                            network.respond_to_client(Response {
-                                to: from,
-                                from: self.id,
-                                msg: ResponseMsg::Initialized(self.raft.is_some()),
-                            });
+                            network
+                                .respond_to_client(Response {
+                                    to: from,
+                                    from: self.id,
+                                    msg: ResponseMsg::Initialized(self.raft.is_some()),
+                                })
+                                .await;
                         }
                         QueryMsg::ReadFrags { from, file_name } => {
                             debug!(self.logger, "GOT READ FRAGS QUERY FROM {from}");
-                            network.respond_to_client(Response {
-                                to: from,
-                                from: self.id,
-                                msg: ResponseMsg::Frags(self.fs.get_frags(&file_name).unwrap()),
-                            });
+                            network
+                                .respond_to_client(Response {
+                                    to: from,
+                                    from: self.id,
+                                    msg: ResponseMsg::Frags(self.fs.get_frags(&file_name).unwrap()),
+                                })
+                                .await;
                         }
                     },
                     Ok(RequestMsg::Control(ctl)) => match ctl {
@@ -222,14 +226,14 @@ impl Node {
                     };
 
                     let prop = Proposal::new_conf_change(self.id, conf_change);
-                    self.network.lock().unwrap().raft_senders[&self.id]
+                    self.network.lock().await.raft_senders[&self.id]
                         .send(RequestMsg::Propose(prop))
                         .await
                         .unwrap();
                 }
             }
 
-            self.on_ready();
+            self.on_ready().await;
         }
     }
 
@@ -239,7 +243,7 @@ impl Node {
             .is_some_and(|r| r.raft.state == StateRole::Leader)
     }
 
-    fn propose(&mut self, prop: &Proposal) {
+    async fn propose(&mut self, prop: &Proposal) {
         let index_before = self.raft_mut().raft.raft_log.last_index();
         let ctx = prop.context_bytes();
         if let Some(frag) = &prop.fragment {
@@ -261,12 +265,12 @@ impl Node {
                         success: false,
                     },
                 };
-                self.network.lock().unwrap().respond_to_client(resp);
+                self.network.lock().await.respond_to_client(resp).await;
             }
         }
     }
 
-    fn on_ready(&mut self) {
+    async fn on_ready(&mut self) {
         let raft = self.raft_mut();
 
         if !raft.has_ready() {
@@ -290,8 +294,9 @@ impl Node {
         if !ready.messages().is_empty() {
             self.network
                 .lock()
-                .unwrap()
-                .send_raft_messages(ready.take_messages());
+                .await
+                .send_raft_messages(ready.take_messages())
+                .await;
         }
 
         if !ready.snapshot().is_empty() {
@@ -299,13 +304,15 @@ impl Node {
             store.apply_snapshot(s).expect("Could not apply snapshot");
         }
 
-        self.handle_commited_entries(ready.take_committed_entries());
+        self.handle_commited_entries(ready.take_committed_entries())
+            .await;
 
         if !ready.persisted_messages().is_empty() {
             self.network
                 .lock()
-                .unwrap()
-                .send_raft_messages(ready.take_persisted_messages());
+                .await
+                .send_raft_messages(ready.take_persisted_messages())
+                .await;
         }
 
         let mut light_rd = self.raft_mut().advance(ready);
@@ -320,10 +327,12 @@ impl Node {
 
         self.network
             .lock()
-            .unwrap()
-            .send_raft_messages(light_rd.take_messages());
+            .await
+            .send_raft_messages(light_rd.take_messages())
+            .await;
 
-        self.handle_commited_entries(light_rd.take_committed_entries());
+        self.handle_commited_entries(light_rd.take_committed_entries())
+            .await;
 
         self.raft_mut().advance_apply();
     }
@@ -336,7 +345,7 @@ impl Node {
         self.raft.as_ref().unwrap()
     }
 
-    fn handle_commited_entries(&mut self, entries: Vec<Entry>) {
+    async fn handle_commited_entries(&mut self, entries: Vec<Entry>) {
         let mut last_apply_index = 0;
         for entry in entries {
             last_apply_index = std::cmp::max(last_apply_index, entry.index);
@@ -376,7 +385,7 @@ impl Node {
                             success: true,
                         },
                     };
-                    self.network.lock().unwrap().respond_to_client(resp);
+                    self.network.lock().await.respond_to_client(resp).await;
                 } else {
                     self.followers_to_add.pop_front();
                 }
@@ -386,4 +395,3 @@ impl Node {
         self.raft_mut().store().compact(last_apply_index).unwrap();
     }
 }
-

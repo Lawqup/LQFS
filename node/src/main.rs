@@ -1,9 +1,8 @@
 #![allow(dead_code)]
 
-use std::{
-    sync::{Arc, Mutex},
-    thread,
-};
+use std::{sync::Arc, thread};
+
+use tokio::sync::Mutex;
 
 use cluster::InitResult;
 use network::{NetworkController, Signal};
@@ -50,20 +49,23 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         network,
         node_handles,
         ..
-    } = cluster::try_restore_cluster(&peers, &[], &logger)
-        .unwrap_or_else(|_| cluster::init_cluster(&peers, &[], &logger));
+    } = match cluster::try_restore_cluster(&peers, &[], &logger).await {
+        Ok(res) => res,
+        Err(_) => cluster::init_cluster(&peers, &[], &logger).await,
+    };
 
     for id in peers {
         network
             .lock()
-            .unwrap()
-            .send_control_message(id, Signal::Shutdown);
+            .await
+            .send_control_message(id, Signal::Shutdown)
+            .await;
     }
 
     for handle in node_handles {
-        handle.join().expect("handle could not be joined");
+        handle.await.unwrap();
     }
 
-    server_handle.join().unwrap();
+    server_handle.join().unwrap().await;
     Ok(())
 }

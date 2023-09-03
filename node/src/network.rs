@@ -9,12 +9,12 @@ use raft::prelude::Message;
 use tonic::Status;
 use uuid::Uuid;
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
+use std::{collections::HashMap, sync::Arc};
 
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::{
+    mpsc::{channel, Receiver, Sender},
+    Mutex,
+};
 
 /// RequestMsgs are all messages sent to nodes
 #[derive(Debug, Clone)]
@@ -131,7 +131,7 @@ impl NetworkController {
     }
 
     pub fn get_node_reciever(&mut self, node_id: u64) -> &mut Receiver<RequestMsg> {
-        &mut self.raft_recievers[&node_id]
+        self.raft_recievers.get_mut(&node_id).unwrap()
     }
 
     pub async fn respond_to_client(&self, response: Response) {
@@ -154,7 +154,7 @@ impl NetworkController {
     }
 
     pub fn get_client_receiver(&mut self, client_id: u64) -> &mut Receiver<Response> {
-        &mut self.client_recievers[&client_id]
+        self.client_recievers.get_mut(&client_id).unwrap()
     }
 
     pub fn broadcast(&mut self, prop: Proposal) {}
@@ -174,8 +174,11 @@ impl query_server::Query for Network {
             file_name: inner.file_name,
         };
 
-        for peer in self.lock().unwrap().peers() {
-            self.lock().unwrap().send_query_message(peer, query.clone());
+        for peer in self.lock().await.peers() {
+            self.lock()
+                .await
+                .send_query_message(peer, query.clone())
+                .await;
         }
         todo!()
     }
