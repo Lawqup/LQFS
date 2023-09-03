@@ -6,9 +6,10 @@ use std::{
     collections::VecDeque,
     fs,
     path::Path,
-    sync::mpsc::TryRecvError,
     time::{Duration, Instant},
 };
+
+use tokio::sync::mpsc::error::TryRecvError;
 
 use crate::{
     frag::{FSManager, Fragment},
@@ -156,15 +157,15 @@ impl Node {
         self.raft_mut().step(msg).unwrap();
     }
 
-    pub fn run(&mut self) {
+    pub async fn run(&mut self) {
         let mut now = Instant::now();
         let network_clone = self.network.clone();
         loop {
             // Keep recieving until there's nothing ready yet,
             // in which case stop recieving to drive the raft
             loop {
-                let network = network_clone.lock().unwrap();
-                match network.get_node_rx(self.id).try_recv() {
+                let mut network = network_clone.lock().unwrap();
+                match network.get_node_reciever(self.id).try_recv() {
                     Ok(RequestMsg::Raft(m)) => {
                         info!(self.logger, "Recieved raft message {m:?}");
                         self.step(m);
@@ -188,7 +189,7 @@ impl Node {
                             network.respond_to_client(Response {
                                 to: from,
                                 from: self.id,
-                                msg: ResponseMsg::Frags(self.fs.get_frags(&file_name)),
+                                msg: ResponseMsg::Frags(self.fs.get_frags(&file_name).unwrap()),
                             });
                         }
                     },
@@ -223,6 +224,7 @@ impl Node {
                     let prop = Proposal::new_conf_change(self.id, conf_change);
                     self.network.lock().unwrap().raft_senders[&self.id]
                         .send(RequestMsg::Propose(prop))
+                        .await
                         .unwrap();
                 }
             }
@@ -384,3 +386,4 @@ impl Node {
         self.raft_mut().store().compact(last_apply_index).unwrap();
     }
 }
+

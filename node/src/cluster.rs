@@ -7,6 +7,8 @@ use std::{
 
 use slog::Logger;
 
+use tokio::task;
+
 use crate::{
     network::{QueryMsg, ResponseMsg},
     prelude::*,
@@ -19,16 +21,15 @@ use crate::{
 
 pub struct InitResult {
     pub network: Network,
-    pub client_rxs: HashMap<u64, Arc<Mutex<Receiver<Response>>>>,
     pub node_handles: Vec<JoinHandle<Node>>,
 }
 
-pub fn init_cluster(peers: &[u64], clients: &[u64], logger: &Logger) -> InitResult {
-    let (network, client_rxs) = NetworkController::new(peers, clients, logger.clone());
+pub async fn init_cluster(peers: &[u64], clients: &[u64], logger: &Logger) -> InitResult {
+    let network = NetworkController::new(peers, clients, logger.clone());
     let network = Arc::new(Mutex::new(network));
 
     let technician = clients.iter().max().copied().unwrap_or_default() + 1;
-    let tech_rx = network.lock().unwrap().add_client(technician);
+    network.lock().unwrap().add_client(technician).await;
 
     let mut node_handles = Vec::new();
     for &id in peers.iter().skip(1) {
@@ -62,7 +63,16 @@ pub fn init_cluster(peers: &[u64], clients: &[u64], logger: &Logger) -> InitResu
                 .lock()
                 .unwrap()
                 .send_query_message(node, QueryMsg::IsInitialized { from: technician });
-            match tech_rx.recv().unwrap().msg {
+
+            match network
+                .lock()
+                .unwrap()
+                .get_client_receiver(technician)
+                .recv()
+                .await
+                .unwrap()
+                .msg
+            {
                 ResponseMsg::Initialized(true) => {
                     to_remove.push(node);
                 }
@@ -81,38 +91,34 @@ pub fn init_cluster(peers: &[u64], clients: &[u64], logger: &Logger) -> InitResu
 
     InitResult {
         network,
-        client_rxs: client_rxs
-            .into_iter()
-            .map(|(c, rx)| (c, Arc::new(Mutex::new(rx))))
-            .collect(),
         node_handles,
     }
 }
 
 /// Restores the cluster from persistent storage.
 /// At least one node's data must have been initialized.
-pub fn try_restore_cluster(peers: &[u64], clients: &[u64], logger: &Logger) -> Result<InitResult> {
-    let (network, client_rxs) = NetworkController::new(peers, clients, logger.clone());
+pub async fn try_restore_cluster(
+    peers: &[u64],
+    clients: &[u64],
+    logger: &Logger,
+) -> Result<InitResult> {
+    let network = NetworkController::new(peers, clients, logger.clone());
     let network = Arc::new(Mutex::new(network));
 
     Ok(InitResult {
         network: network.clone(),
-        client_rxs: client_rxs
-            .into_iter()
-            .map(|(c, rx)| (c, Arc::new(Mutex::new(rx))))
-            .collect(),
-        node_handles: try_restore_cluster_with_network(peers, clients, logger, network)?,
+        node_handles: try_restore_cluster_with_network(peers, clients, logger, network).await?,
     })
 }
 
-fn try_restore_cluster_with_network(
+async fn try_restore_cluster_with_network(
     peers: &[u64],
     clients: &[u64],
     logger: &Logger,
     network: Network,
 ) -> Result<Vec<JoinHandle<Node>>> {
     let technician = clients.iter().max().copied().unwrap_or_default() + 1;
-    let tech_rx = network.lock().unwrap().add_client(technician);
+    network.lock().unwrap().add_client(technician);
 
     let mut can_recover = false;
     let mut nodes = Vec::new();
@@ -147,7 +153,16 @@ fn try_restore_cluster_with_network(
                 .lock()
                 .unwrap()
                 .send_query_message(node, QueryMsg::IsInitialized { from: technician });
-            match tech_rx.recv().unwrap().msg {
+
+            match network
+                .lock()
+                .unwrap()
+                .get_client_receiver(technician)
+                .recv()
+                .await
+                .unwrap()
+                .msg
+            {
                 ResponseMsg::Initialized(true) => {
                     to_remove.push(node);
                 }
@@ -176,6 +191,8 @@ mod test {
         thread::{self, JoinHandle},
         time::Duration,
     };
+
+    use tokio::task;
 
     use ntest::{test_case, timeout};
     use raft::StateRole;
@@ -228,7 +245,7 @@ mod test {
 
         let proposals_clone = proposals.clone();
         let logger_clone = logger.clone();
-        thread::spawn(move || {
+        task::spawn(async {
             while !proposals_clone.lock().unwrap().is_empty() {
                 debug!(
                     logger_clone,
@@ -236,10 +253,11 @@ mod test {
                     proposals_clone.lock().unwrap().len()
                 );
 
-                for prop in proposals_clone.lock().unwrap().values() {
+                let props = proposals_clone.lock().unwrap().values();
+                for prop in props {
                     info!(logger_clone, "CLIENT proposal ({}, {})", prop.id, prop.from);
                     for tx in network.lock().unwrap().raft_senders.values() {
-                        tx.send(RequestMsg::Propose(prop.clone())).unwrap();
+                        tx.send(RequestMsg::Propose(prop.clone())).await.unwrap();
                     }
                     thread::sleep(DURATION_PER_PROPOSAL);
                 }

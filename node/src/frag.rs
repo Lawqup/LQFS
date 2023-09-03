@@ -7,7 +7,12 @@ use std::{
 
 use crate::prelude::*;
 
-tonic::include_proto!("fragment");
+#[allow(non_snake_case)]
+mod fragment {
+    tonic::include_proto!("fragment");
+}
+
+pub use fragment::*;
 
 pub struct FSManager {
     dir: PathBuf,
