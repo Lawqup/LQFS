@@ -10,11 +10,12 @@ use tonic::Status;
 use uuid::Uuid;
 
 use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
+    collections::{hash_map, HashMap},
+    sync::{
+        mpsc::{channel, Receiver, Sender},
+        Arc, Mutex,
+    },
 };
-
-use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 /// RequestMsgs are all messages sent to nodes
 #[derive(Debug, Clone)]
@@ -69,7 +70,7 @@ impl NetworkController {
             .iter()
             .copied()
             .map(|id| {
-                let (s, r) = channel(100);
+                let (s, r) = channel();
                 ((id, s), (id, r))
             })
             .unzip();
@@ -78,7 +79,7 @@ impl NetworkController {
             .iter()
             .copied()
             .map(|id| {
-                let (tx, rx) = channel(100);
+                let (tx, rx) = channel();
                 ((id, tx), (id, rx))
             })
             .unzip();
@@ -92,36 +93,27 @@ impl NetworkController {
         }
     }
 
-    pub async fn send_control_message(&self, to: u64, msg: Signal) {
+    pub fn send_control_message(&self, to: u64, msg: Signal) {
         if self.raft_senders[&to]
             .send(RequestMsg::Control(msg))
-            .await
             .is_err()
         {
             error!(self.logger, "Failed to send control message to {to}");
         }
     }
 
-    pub async fn send_query_message(&self, to: u64, msg: QueryMsg) {
-        if self.raft_senders[&to]
-            .send(RequestMsg::Query(msg))
-            .await
-            .is_err()
-        {
+    pub fn send_query_message(&self, to: u64, msg: QueryMsg) {
+        if self.raft_senders[&to].send(RequestMsg::Query(msg)).is_err() {
             error!(self.logger, "Failed to send query message to {to}");
         }
     }
 
-    pub async fn send_raft_messages(&self, msgs: Vec<Message>) {
+    pub fn send_raft_messages(&self, msgs: Vec<Message>) {
         for msg in msgs {
             let to = msg.to;
             let from = msg.from;
 
-            if self.raft_senders[&to]
-                .send(RequestMsg::Raft(msg))
-                .await
-                .is_err()
-            {
+            if self.raft_senders[&to].send(RequestMsg::Raft(msg)).is_err() {
                 error!(
                     self.logger,
                     "Failed to send raft message from {from} to {to}"
@@ -130,22 +122,19 @@ impl NetworkController {
         }
     }
 
-    pub fn get_node_reciever(&mut self, node_id: u64) -> &mut Receiver<RequestMsg> {
-        &mut self.raft_recievers[&node_id]
+    pub fn get_node_reciever(&mut self, node_id: u64) -> &Receiver<RequestMsg> {
+        &self.raft_recievers[&node_id]
     }
 
-    pub async fn respond_to_client(&self, response: Response) {
-        self.client_senders[&response.to]
-            .send(response)
-            .await
-            .unwrap();
+    pub fn respond_to_client(&self, response: Response) {
+        self.client_senders[&response.to].send(response).unwrap();
     }
 
-    pub async fn add_client(&mut self, client_id: u64) {
-        if !self.client_recievers.contains_key(&client_id) {
-            let (s, r) = channel(100);
+    pub fn add_client(&mut self, client_id: u64) {
+        if let hash_map::Entry::Vacant(e) = self.client_recievers.entry(client_id) {
+            let (s, r) = channel();
             self.client_senders.insert(client_id, s);
-            self.client_recievers.insert(client_id, r);
+            e.insert(r);
         }
     }
 
@@ -153,11 +142,9 @@ impl NetworkController {
         self.raft_senders.keys().copied().collect()
     }
 
-    pub fn get_client_receiver(&mut self, client_id: u64) -> &mut Receiver<Response> {
-        &mut self.client_recievers[&client_id]
+    pub fn get_client_receiver(&mut self, client_id: u64) -> &Receiver<Response> {
+        &self.client_recievers[&client_id]
     }
-
-    pub fn broadcast(&mut self, prop: Proposal) {}
 }
 
 pub type Network = Arc<Mutex<NetworkController>>;

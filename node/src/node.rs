@@ -6,10 +6,9 @@ use std::{
     collections::VecDeque,
     fs,
     path::Path,
+    sync::mpsc::TryRecvError,
     time::{Duration, Instant},
 };
-
-use tokio::sync::mpsc::error::TryRecvError;
 
 use crate::{
     frag::{FSManager, Fragment},
@@ -130,7 +129,7 @@ impl Node {
     }
 
     pub fn init_from_message(&mut self, msg: &Message) -> Result<()> {
-        match MessageType::from_i32(msg.msg_type.into()).unwrap() {
+        match MessageType::from_i32(msg.msg_type).unwrap() {
             MessageType::MsgRequestVote | MessageType::MsgRequestPreVote => {}
             MessageType::MsgHeartbeat if msg.commit == 0 => {}
             _ => return Err(Error::InitError),
@@ -157,7 +156,7 @@ impl Node {
         self.raft_mut().step(msg).unwrap();
     }
 
-    pub async fn run(&mut self) {
+    pub fn run(&mut self) {
         let mut now = Instant::now();
         let network_clone = self.network.clone();
         loop {
@@ -224,7 +223,6 @@ impl Node {
                     let prop = Proposal::new_conf_change(self.id, conf_change);
                     self.network.lock().unwrap().raft_senders[&self.id]
                         .send(RequestMsg::Propose(prop))
-                        .await
                         .unwrap();
                 }
             }
@@ -386,4 +384,3 @@ impl Node {
         self.raft_mut().store().compact(last_apply_index).unwrap();
     }
 }
-

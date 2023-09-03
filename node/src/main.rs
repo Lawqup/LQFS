@@ -64,6 +64,6 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         handle.join().expect("handle could not be joined");
     }
 
-    server_handle.join().unwrap();
+    server_handle.join().unwrap().await;
     Ok(())
 }

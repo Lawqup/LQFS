@@ -66,7 +66,6 @@ impl FSManager {
                     file_idx: idx.parse().unwrap(),
                     total_frags: total.parse().unwrap(),
                     data,
-                    ..Default::default()
                 })
             })
             .collect()

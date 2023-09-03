@@ -439,7 +439,7 @@ impl LogStore for NodeStorage {
         let conf_state = store.get_conf_state(&mut tx)?;
 
         let mut snapshot = Snapshot::default();
-        snapshot.set_data(data.into());
+        snapshot.set_data(data);
 
         let metadata = snapshot.mut_metadata();
         metadata.set_conf_state(conf_state);

@@ -1,13 +1,11 @@
 use std::{
-    collections::{HashMap, HashSet},
-    sync::{mpsc::Receiver, Arc, Mutex},
+    collections::HashSet,
+    sync::{Arc, Mutex},
     thread::{self, JoinHandle},
     time::Duration,
 };
 
 use slog::Logger;
-
-use tokio::task;
 
 use crate::{
     network::{QueryMsg, ResponseMsg},
@@ -15,7 +13,7 @@ use crate::{
 };
 
 use crate::{
-    network::{Network, NetworkController, Response},
+    network::{Network, NetworkController},
     node::Node,
 };
 
@@ -24,12 +22,12 @@ pub struct InitResult {
     pub node_handles: Vec<JoinHandle<Node>>,
 }
 
-pub async fn init_cluster(peers: &[u64], clients: &[u64], logger: &Logger) -> InitResult {
+pub fn init_cluster(peers: &[u64], clients: &[u64], logger: &Logger) -> InitResult {
     let network = NetworkController::new(peers, clients, logger.clone());
     let network = Arc::new(Mutex::new(network));
 
     let technician = clients.iter().max().copied().unwrap_or_default() + 1;
-    network.lock().unwrap().add_client(technician).await;
+    network.lock().unwrap().add_client(technician);
 
     let mut node_handles = Vec::new();
     for &id in peers.iter().skip(1) {
@@ -69,7 +67,6 @@ pub async fn init_cluster(peers: &[u64], clients: &[u64], logger: &Logger) -> In
                 .unwrap()
                 .get_client_receiver(technician)
                 .recv()
-                .await
                 .unwrap()
                 .msg
             {
@@ -97,21 +94,17 @@ pub async fn init_cluster(peers: &[u64], clients: &[u64], logger: &Logger) -> In
 
 /// Restores the cluster from persistent storage.
 /// At least one node's data must have been initialized.
-pub async fn try_restore_cluster(
-    peers: &[u64],
-    clients: &[u64],
-    logger: &Logger,
-) -> Result<InitResult> {
+pub fn try_restore_cluster(peers: &[u64], clients: &[u64], logger: &Logger) -> Result<InitResult> {
     let network = NetworkController::new(peers, clients, logger.clone());
     let network = Arc::new(Mutex::new(network));
 
     Ok(InitResult {
         network: network.clone(),
-        node_handles: try_restore_cluster_with_network(peers, clients, logger, network).await?,
+        node_handles: try_restore_cluster_with_network(peers, clients, logger, network)?,
     })
 }
 
-async fn try_restore_cluster_with_network(
+fn try_restore_cluster_with_network(
     peers: &[u64],
     clients: &[u64],
     logger: &Logger,
@@ -159,7 +152,6 @@ async fn try_restore_cluster_with_network(
                 .unwrap()
                 .get_client_receiver(technician)
                 .recv()
-                .await
                 .unwrap()
                 .msg
             {
@@ -187,12 +179,10 @@ mod test {
     use std::{
         collections::HashMap,
         env, fs,
-        sync::{mpsc::Receiver, Arc, Mutex},
+        sync::{Arc, Mutex},
         thread::{self, JoinHandle},
         time::Duration,
     };
-
-    use tokio::task;
 
     use ntest::{test_case, timeout};
     use raft::StateRole;
@@ -200,7 +190,7 @@ mod test {
     use crate::{
         cluster::{init_cluster, try_restore_cluster_with_network, InitResult},
         frag::Fragment,
-        network::{Network, QueryMsg, RequestMsg, Response, ResponseMsg, Signal},
+        network::{Network, QueryMsg, RequestMsg, ResponseMsg, Signal},
         prelude::*,
     };
 
@@ -223,7 +213,6 @@ mod test {
     fn spawn_client(
         client_id: u64,
         n_proposals: usize,
-        client_rx: Arc<Mutex<Receiver<Response>>>,
         logger: Logger,
         network: Network,
     ) -> JoinHandle<()> {
@@ -245,7 +234,8 @@ mod test {
 
         let proposals_clone = proposals.clone();
         let logger_clone = logger.clone();
-        task::spawn(async {
+        let network_clone = network.clone();
+        thread::spawn(move || {
             while !proposals_clone.lock().unwrap().is_empty() {
                 debug!(
                     logger_clone,
@@ -253,11 +243,10 @@ mod test {
                     proposals_clone.lock().unwrap().len()
                 );
 
-                let props = proposals_clone.lock().unwrap().values();
-                for prop in props {
+                for prop in proposals_clone.lock().unwrap().values() {
                     info!(logger_clone, "CLIENT proposal ({}, {})", prop.id, prop.from);
-                    for tx in network.lock().unwrap().raft_senders.values() {
-                        tx.send(RequestMsg::Propose(prop.clone())).await.unwrap();
+                    for tx in network_clone.lock().unwrap().raft_senders.values() {
+                        tx.send(RequestMsg::Propose(prop.clone())).unwrap();
                     }
                     thread::sleep(DURATION_PER_PROPOSAL);
                 }
@@ -267,7 +256,11 @@ mod test {
 
         thread::spawn(move || {
             while !proposals.lock().unwrap().is_empty() {
-                let res = client_rx.lock().unwrap().recv_timeout(CLIENT_TIMEOUT);
+                let res = network
+                    .lock()
+                    .unwrap()
+                    .get_client_receiver(client_id)
+                    .recv_timeout(CLIENT_TIMEOUT);
 
                 assert!(
                     res.is_ok(),
@@ -301,18 +294,12 @@ mod test {
         })
     }
 
-    fn spawn_clients(
-        clients: &[u64],
-        mut client_rxs: HashMap<u64, Arc<Mutex<Receiver<Response>>>>,
-        logger: &Logger,
-        network: Network,
-    ) -> Vec<JoinHandle<()>> {
+    fn spawn_clients(clients: &[u64], logger: &Logger, network: Network) -> Vec<JoinHandle<()>> {
         let mut client_handles = Vec::new();
         for &client_id in clients {
             client_handles.push(spawn_client(
                 client_id,
                 N_PROPOSALS,
-                client_rxs.remove(&client_id).unwrap(),
                 logger.clone(),
                 network.clone(),
             ));
@@ -326,7 +313,6 @@ mod test {
     pub fn client_get_file(
         file_name: &str,
         client_id: u64,
-        client_rx: Arc<Mutex<Receiver<Response>>>,
         network: Network,
         logger: &Logger,
     ) -> Result<Vec<u8>> {
@@ -348,10 +334,11 @@ mod test {
         let queries = Arc::new(Mutex::new(queries));
 
         let queries_clone = queries.clone();
+        let network_clone = network.clone();
         thread::spawn(move || {
             while !queries_clone.lock().unwrap().is_empty() {
                 for (to, query) in queries_clone.lock().unwrap().iter() {
-                    network
+                    network_clone
                         .lock()
                         .unwrap()
                         .send_query_message(*to, query.clone());
@@ -365,7 +352,11 @@ mod test {
         let mut frags = HashMap::new();
 
         while !queries.lock().unwrap().is_empty() {
-            let res = client_rx.lock().unwrap().recv_timeout(CLIENT_TIMEOUT);
+            let res = network
+                .lock()
+                .unwrap()
+                .get_client_receiver(client_id)
+                .recv_timeout(CLIENT_TIMEOUT);
 
             assert!(
                 res.is_ok(),
@@ -378,7 +369,7 @@ mod test {
                     info!(logger, "Client {client_id} got fragment response");
 
                     assert_eq!(res.to, client_id);
-                    for frag in f.expect("Frags were not successfully recieved") {
+                    for frag in f {
                         frags.insert(frag.file_idx, frag);
                     }
 
@@ -476,24 +467,16 @@ mod test {
             let InitResult {
                 network,
                 node_handles,
-                client_rxs,
                 ..
             } = init_cluster(&peers, &clients, &logger);
 
-            let client_handles =
-                spawn_clients(&clients, client_rxs.clone(), &logger, network.clone());
+            let client_handles = spawn_clients(&clients, &logger, network.clone());
 
             cleanup(Some(client_handles), None, network.clone());
 
             for c in clients {
-                let file = client_get_file(
-                    &c.to_string(),
-                    c,
-                    client_rxs[&c].clone(),
-                    network.clone(),
-                    &logger,
-                )
-                .expect("Could not get file");
+                let file = client_get_file(&c.to_string(), c, network.clone(), &logger)
+                    .expect("Could not get file");
 
                 info!(logger, "Got file for client {c} with contents: {file:?}");
 
@@ -521,11 +504,10 @@ mod test {
             let InitResult {
                 network,
                 node_handles,
-                client_rxs,
                 ..
             } = init_cluster(&peers, &clients, &logger);
 
-            let client_handles = spawn_clients(&clients, client_rxs, &logger, network.clone());
+            let client_handles = spawn_clients(&clients, &logger, network.clone());
 
             network
                 .lock()
@@ -548,11 +530,10 @@ mod test {
             let InitResult {
                 network,
                 node_handles,
-                client_rxs,
                 ..
             } = init_cluster(&peers, &clients, &logger);
 
-            let client_handles = spawn_clients(&clients, client_rxs, &logger, network.clone());
+            let client_handles = spawn_clients(&clients, &logger, network.clone());
             thread::sleep(Duration::from_millis(100));
 
             cleanup(None, Some((&peers, node_handles)), network.clone());
