@@ -56,22 +56,22 @@ pub struct Response {
 }
 
 /// Manages all global state including which nodes are available
-pub struct NetworkController {
-    pub raft_senders: HashMap<u64, Sender<RequestMsg>>,
-    raft_recievers: HashMap<u64, Receiver<RequestMsg>>,
+struct NetworkController {
+    raft_senders: HashMap<u64, Sender<RequestMsg>>,
+    raft_recievers: HashMap<u64, Arc<Mutex<Receiver<RequestMsg>>>>,
     client_senders: HashMap<u64, Sender<Response>>,
-    client_recievers: HashMap<u64, Receiver<Response>>,
+    client_recievers: HashMap<u64, Arc<Mutex<Receiver<Response>>>>,
     logger: Logger,
 }
 
 impl NetworkController {
-    pub fn new(peers: &[u64], clients: &[u64], logger: Logger) -> Self {
+    fn new(peers: &[u64], clients: &[u64], logger: Logger) -> Self {
         let (raft_senders, raft_recievers) = peers
             .iter()
             .copied()
             .map(|id| {
                 let (s, r) = channel();
-                ((id, s), (id, r))
+                ((id, s), (id, Arc::new(Mutex::new(r))))
             })
             .unzip();
 
@@ -79,8 +79,8 @@ impl NetworkController {
             .iter()
             .copied()
             .map(|id| {
-                let (tx, rx) = channel();
-                ((id, tx), (id, rx))
+                let (s, r) = channel();
+                ((id, s), (id, Arc::new(Mutex::new(r))))
             })
             .unzip();
 
@@ -108,6 +108,15 @@ impl NetworkController {
         }
     }
 
+    pub fn send_proposal_message(&self, to: u64, msg: Proposal) {
+        if self.raft_senders[&to]
+            .send(RequestMsg::Propose(msg))
+            .is_err()
+        {
+            error!(self.logger, "Failed to send proposal message to {to}");
+        }
+    }
+
     pub fn send_raft_messages(&self, msgs: Vec<Message>) {
         for msg in msgs {
             let to = msg.to;
@@ -122,10 +131,6 @@ impl NetworkController {
         }
     }
 
-    pub fn get_node_reciever(&mut self, node_id: u64) -> &Receiver<RequestMsg> {
-        &self.raft_recievers[&node_id]
-    }
-
     pub fn respond_to_client(&self, response: Response) {
         self.client_senders[&response.to].send(response).unwrap();
     }
@@ -134,20 +139,63 @@ impl NetworkController {
         if let hash_map::Entry::Vacant(e) = self.client_recievers.entry(client_id) {
             let (s, r) = channel();
             self.client_senders.insert(client_id, s);
-            e.insert(r);
+            e.insert(Arc::new(Mutex::new(r)));
         }
-    }
-
-    pub fn peers(&self) -> Vec<u64> {
-        self.raft_senders.keys().copied().collect()
-    }
-
-    pub fn get_client_receiver(&mut self, client_id: u64) -> &Receiver<Response> {
-        &self.client_recievers[&client_id]
     }
 }
 
-pub type Network = Arc<Mutex<NetworkController>>;
+#[derive(Clone)]
+pub struct Network(Arc<Mutex<NetworkController>>);
+
+impl Network {
+    pub fn new(peers: &[u64], clients: &[u64], logger: Logger) -> Self {
+        Network(Arc::new(Mutex::new(NetworkController::new(
+            peers, clients, logger,
+        ))))
+    }
+
+    pub fn send_control_message(&self, to: u64, msg: Signal) {
+        self.0.lock().unwrap().send_control_message(to, msg);
+    }
+
+    pub fn send_query_message(&self, to: u64, msg: QueryMsg) {
+        self.0.lock().unwrap().send_query_message(to, msg);
+    }
+
+    pub fn send_proposal_message(&self, to: u64, msg: Proposal) {
+        self.0.lock().unwrap().send_proposal_message(to, msg);
+    }
+
+    pub fn send_raft_messages(&self, msgs: Vec<Message>) {
+        self.0.lock().unwrap().send_raft_messages(msgs);
+    }
+
+    pub fn respond_to_client(&self, response: Response) {
+        self.0.lock().unwrap().respond_to_client(response);
+    }
+
+    pub fn add_client(&self, client_id: u64) {
+        self.0.lock().unwrap().add_client(client_id);
+    }
+
+    pub fn peers(&self) -> Vec<u64> {
+        self.0
+            .lock()
+            .unwrap()
+            .raft_senders
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    pub fn get_node_reciever(&self, node_id: u64) -> Arc<Mutex<Receiver<RequestMsg>>> {
+        self.0.lock().unwrap().raft_recievers[&node_id].clone()
+    }
+
+    pub fn get_client_receiver(&self, client_id: u64) -> Arc<Mutex<Receiver<Response>>> {
+        self.0.lock().unwrap().client_recievers[&client_id].clone()
+    }
+}
 
 #[tonic::async_trait]
 impl query_server::Query for Network {
@@ -161,9 +209,10 @@ impl query_server::Query for Network {
             file_name: inner.file_name,
         };
 
-        for peer in self.lock().unwrap().peers() {
-            self.lock().unwrap().send_query_message(peer, query.clone());
+        for peer in self.peers() {
+            self.send_query_message(peer, query.clone());
         }
+
         todo!()
     }
 }

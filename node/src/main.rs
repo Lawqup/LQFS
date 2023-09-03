@@ -1,12 +1,9 @@
 #![allow(dead_code)]
 
-use std::{
-    sync::{Arc, Mutex},
-    thread,
-};
+use std::thread;
 
 use cluster::InitResult;
-use network::{NetworkController, Signal};
+use network::{Network, Signal};
 use prelude::*;
 use service::query_server::QueryServer;
 use tonic::transport::Server;
@@ -30,11 +27,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let peers: Vec<u64> = (1..=N_PEERS).collect();
     let logger = build_default_logger();
 
-    let network = Arc::new(Mutex::new(NetworkController::new(
-        &peers,
-        &[],
-        logger.clone(),
-    )));
+    let network = Network::new(&peers, &[], logger.clone());
 
     let query_service = QueryServer::new(network);
     let server_handle = thread::spawn(move || async {
@@ -54,10 +47,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| cluster::init_cluster(&peers, &[], &logger));
 
     for id in peers {
-        network
-            .lock()
-            .unwrap()
-            .send_control_message(id, Signal::Shutdown);
+        network.send_control_message(id, Signal::Shutdown);
     }
 
     for handle in node_handles {

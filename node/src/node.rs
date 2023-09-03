@@ -97,7 +97,7 @@ impl Node {
 
         let mut followers_to_add = VecDeque::new();
 
-        for peer in network.lock().unwrap().peers() {
+        for peer in network.peers() {
             if peer != id {
                 followers_to_add.push_front(peer);
             }
@@ -158,13 +158,17 @@ impl Node {
 
     pub fn run(&mut self) {
         let mut now = Instant::now();
-        let network_clone = self.network.clone();
+        let network = self.network.clone();
         loop {
             // Keep recieving until there's nothing ready yet,
             // in which case stop recieving to drive the raft
             loop {
-                let mut network = network_clone.lock().unwrap();
-                match network.get_node_reciever(self.id).try_recv() {
+                match network
+                    .get_node_reciever(self.id)
+                    .lock()
+                    .unwrap()
+                    .try_recv()
+                {
                     Ok(RequestMsg::Raft(m)) => {
                         info!(self.logger, "Recieved raft message {m:?}");
                         self.step(m);
@@ -177,7 +181,7 @@ impl Node {
                     }
                     Ok(RequestMsg::Query(q)) => match q {
                         QueryMsg::IsInitialized { from } => {
-                            network.respond_to_client(Response {
+                            self.network.respond_to_client(Response {
                                 to: from,
                                 from: self.id,
                                 msg: ResponseMsg::Initialized(self.raft.is_some()),
@@ -185,7 +189,7 @@ impl Node {
                         }
                         QueryMsg::ReadFrags { from, file_name } => {
                             debug!(self.logger, "GOT READ FRAGS QUERY FROM {from}");
-                            network.respond_to_client(Response {
+                            self.network.respond_to_client(Response {
                                 to: from,
                                 from: self.id,
                                 msg: ResponseMsg::Frags(self.fs.get_frags(&file_name).unwrap()),
@@ -221,9 +225,7 @@ impl Node {
                     };
 
                     let prop = Proposal::new_conf_change(self.id, conf_change);
-                    self.network.lock().unwrap().raft_senders[&self.id]
-                        .send(RequestMsg::Propose(prop))
-                        .unwrap();
+                    self.propose(&prop);
                 }
             }
 
@@ -247,20 +249,18 @@ impl Node {
             let _ = self.raft_mut().propose_conf_change(ctx, cc.clone());
         }
 
-        if index_before == self.raft_mut().raft.raft_log.last_index() {
-            // Log didn't grow, so proposal failed
-            if prop.is_fragment() {
-                // Fragment proposals come from client, so respond over network
-                let resp = Response {
-                    to: prop.from,
-                    from: self.id,
-                    msg: ResponseMsg::Proposed {
-                        proposal_id: prop.id,
-                        success: false,
-                    },
-                };
-                self.network.lock().unwrap().respond_to_client(resp);
-            }
+        // If log didn't grow proposal failed
+        if index_before == self.raft_mut().raft.raft_log.last_index() && prop.is_fragment() {
+            // Fragment proposals come from client, so respond over network
+            let resp = Response {
+                to: prop.from,
+                from: self.id,
+                msg: ResponseMsg::Proposed {
+                    proposal_id: prop.id,
+                    success: false,
+                },
+            };
+            self.network.respond_to_client(resp);
         }
     }
 
@@ -286,10 +286,7 @@ impl Node {
         }
 
         if !ready.messages().is_empty() {
-            self.network
-                .lock()
-                .unwrap()
-                .send_raft_messages(ready.take_messages());
+            self.network.send_raft_messages(ready.take_messages());
         }
 
         if !ready.snapshot().is_empty() {
@@ -301,8 +298,6 @@ impl Node {
 
         if !ready.persisted_messages().is_empty() {
             self.network
-                .lock()
-                .unwrap()
                 .send_raft_messages(ready.take_persisted_messages());
         }
 
@@ -316,10 +311,7 @@ impl Node {
                 .expect("Could not update hard state");
         }
 
-        self.network
-            .lock()
-            .unwrap()
-            .send_raft_messages(light_rd.take_messages());
+        self.network.send_raft_messages(light_rd.take_messages());
 
         self.handle_commited_entries(light_rd.take_committed_entries());
 
@@ -374,7 +366,7 @@ impl Node {
                             success: true,
                         },
                     };
-                    self.network.lock().unwrap().respond_to_client(resp);
+                    self.network.respond_to_client(resp);
                 } else {
                     self.followers_to_add.pop_front();
                 }
