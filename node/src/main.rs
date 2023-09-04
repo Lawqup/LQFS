@@ -4,6 +4,7 @@ use std::thread;
 
 use cluster::InitResult;
 use network::{Network, Signal};
+use persy::Persy;
 use prelude::*;
 use service::query_server::QueryServer;
 use tonic::transport::Server;
@@ -27,17 +28,17 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let peers: Vec<u64> = (1..=N_PEERS).collect();
     let logger = build_default_logger();
 
-    let network = Network::new(&peers, &[], logger.clone());
+    // let network = Network::new(&peers, logger.clone());
 
-    let query_service = QueryServer::new(network);
-    let server_handle = thread::spawn(move || async {
-        let addr = "[::1]:50051".parse().unwrap();
-        Server::builder()
-            .add_service(query_service)
-            .serve(addr)
-            .await
-            .unwrap();
-    });
+    // let query_service = QueryServer::new(network);
+    // let server_handle = thread::spawn(move || async {
+    //     let addr = "[::1]:50051".parse().unwrap();
+    //     Server::builder()
+    //         .add_service(query_service)
+    //         .serve(addr)
+    //         .await
+    //         .unwrap();
+    // });
 
     let InitResult {
         network,
@@ -54,6 +55,6 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         handle.join().expect("handle could not be joined");
     }
 
-    server_handle.join().unwrap().await;
+    // server_handle.join().unwrap().await;
     Ok(())
 }

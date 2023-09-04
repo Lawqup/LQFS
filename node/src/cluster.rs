@@ -18,10 +18,7 @@ pub struct InitResult {
 }
 
 pub fn init_cluster(peers: &[u64], clients: &[u64], logger: &Logger) -> InitResult {
-    let network = Network::new(peers, clients, logger.clone());
-
-    let technician = clients.iter().max().copied().unwrap_or_default() + 1;
-    network.add_client(technician);
+    let network = Network::new(peers, logger.clone());
 
     let mut node_handles = Vec::new();
     for &id in peers.iter().skip(1) {
@@ -46,36 +43,7 @@ pub fn init_cluster(peers: &[u64], clients: &[u64], logger: &Logger) -> InitResu
         leader
     }));
 
-    let mut still_uninit: HashSet<u64> = peers.iter().copied().collect();
-    while !still_uninit.is_empty() {
-        let mut to_remove = Vec::new();
-
-        for node in still_uninit.iter().copied() {
-            network.send_query_message(node, QueryMsg::IsInitialized { from: technician });
-
-            match network
-                .get_client_receiver(technician)
-                .lock()
-                .unwrap()
-                .recv()
-                .unwrap()
-                .msg
-            {
-                ResponseMsg::Initialized(true) => {
-                    to_remove.push(node);
-                }
-                ResponseMsg::Initialized(false) => (),
-                _ => panic!("Incorrect response variant recieved"),
-            }
-        }
-
-        for node in to_remove.iter() {
-            still_uninit.remove(node);
-        }
-        to_remove.clear();
-
-        thread::sleep(Duration::from_millis(200));
-    }
+    wait_until_cluster_initialized(clients, peers, network.clone());
 
     InitResult {
         network,
@@ -83,10 +51,49 @@ pub fn init_cluster(peers: &[u64], clients: &[u64], logger: &Logger) -> InitResu
     }
 }
 
+fn wait_until_cluster_initialized(clients: &[u64], peers: &[u64], network: Network) {
+    let technician = clients.iter().max().copied().unwrap_or_default() + 1;
+
+    let mut still_uninit: HashSet<(u64, Uuid)> = peers
+        .iter()
+        .copied()
+        .map(|node| (node, Uuid::new_v4()))
+        .collect();
+
+    while !still_uninit.is_empty() {
+        let mut to_remove = Vec::new();
+
+        for (node, query_id) in still_uninit.iter().copied() {
+            network.send_query_message(
+                node,
+                QueryMsg::IsInitialized {
+                    id: query_id,
+                    from: technician,
+                },
+            );
+
+            match network.wait_for_response(query_id).msg {
+                ResponseMsg::IsInitialized(true) => {
+                    to_remove.push((node, query_id));
+                }
+                ResponseMsg::IsInitialized(false) => (),
+                _ => panic!("Incorrect response variant recieved"),
+            }
+        }
+
+        for q in to_remove.iter() {
+            still_uninit.remove(q);
+        }
+        to_remove.clear();
+
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
 /// Restores the cluster from persistent storage.
 /// At least one node's data must have been initialized.
 pub fn try_restore_cluster(peers: &[u64], clients: &[u64], logger: &Logger) -> Result<InitResult> {
-    let network = Network::new(peers, clients, logger.clone());
+    let network = Network::new(peers, logger.clone());
 
     Ok(InitResult {
         network: network.clone(),
@@ -100,9 +107,6 @@ fn try_restore_cluster_with_network(
     logger: &Logger,
     network: Network,
 ) -> Result<Vec<JoinHandle<Node>>> {
-    let technician = clients.iter().max().copied().unwrap_or_default() + 1;
-    network.add_client(technician);
-
     let mut can_recover = false;
     let mut nodes = Vec::new();
     for &id in peers.iter() {
@@ -127,36 +131,7 @@ fn try_restore_cluster_with_network(
         }));
     }
 
-    let mut still_uninit: HashSet<u64> = peers.iter().copied().collect();
-    while !still_uninit.is_empty() {
-        let mut to_remove = Vec::new();
-
-        for node in still_uninit.iter().copied() {
-            network.send_query_message(node, QueryMsg::IsInitialized { from: technician });
-
-            match network
-                .get_client_receiver(technician)
-                .lock()
-                .unwrap()
-                .recv()
-                .unwrap()
-                .msg
-            {
-                ResponseMsg::Initialized(true) => {
-                    to_remove.push(node);
-                }
-                ResponseMsg::Initialized(false) => (),
-                _ => panic!("Incorrect response variant recieved"),
-            }
-        }
-
-        for node in to_remove.iter() {
-            still_uninit.remove(node);
-        }
-        to_remove.clear();
-
-        thread::sleep(Duration::from_millis(200));
-    }
+    wait_until_cluster_initialized(clients, peers, network.clone());
 
     Ok(node_handles)
 }
@@ -203,7 +178,7 @@ mod test {
         logger: Logger,
         network: Network,
     ) -> JoinHandle<()> {
-        let proposals: HashMap<Uuid, Proposal> = (0..n_proposals)
+        let proposals: Vec<Proposal> = (0..n_proposals)
             .map(|i| {
                 let frag = Fragment {
                     name: client_id.to_string(),
@@ -211,8 +186,7 @@ mod test {
                     total_frags: n_proposals as u64,
                     data: i.to_le_bytes().to_vec(),
                 };
-                let prop = Proposal::new_fragment(client_id, frag);
-                (prop.id, prop)
+                Proposal::new_fragment(client_id, frag)
             })
             .collect();
 
@@ -229,7 +203,7 @@ mod test {
                     proposals_clone.lock().unwrap().len()
                 );
 
-                for prop in proposals_clone.lock().unwrap().values() {
+                for prop in proposals_clone.lock().unwrap().iter() {
                     info!(logger_clone, "CLIENT proposal ({}, {})", prop.id, prop.from);
                     for peer in network_clone.peers() {
                         network_clone.send_proposal_message(peer, prop.clone());
@@ -242,34 +216,26 @@ mod test {
 
         thread::spawn(move || {
             while !proposals.lock().unwrap().is_empty() {
-                let res = network
-                    .get_client_receiver(client_id)
-                    .lock()
-                    .unwrap()
-                    .recv_timeout(CLIENT_TIMEOUT);
+                let prop_id = proposals.lock().unwrap().last().unwrap().id;
+                let res = network.wait_for_response_timeout(prop_id, CLIENT_TIMEOUT);
 
                 assert!(
-                    res.is_ok(),
+                    res.is_some(),
                     "Client {client_id} waited too long for response"
                 );
 
                 let res = res.unwrap();
                 match res.msg {
-                    ResponseMsg::Proposed {
-                        proposal_id,
-                        success,
-                    } => {
-                        proposals
-                            .lock()
-                            .unwrap()
-                            .remove(&proposal_id)
-                            .expect("Proposal didn't exist in the queue.");
+                    ResponseMsg::IsProposed(success) => {
+                        let last = proposals.lock().unwrap().len() - 1;
+                        proposals.lock().unwrap().remove(last);
 
                         assert_eq!(res.to, client_id);
+                        assert_eq!(res.id, prop_id);
                         info!(
                             logger,
                             "Proposal ({}, {}) {}",
-                            proposal_id,
+                            prop_id,
                             res.to,
                             if success { "SUCCESS" } else { "FAILURE" }
                         );
@@ -302,11 +268,12 @@ mod test {
         network: Network,
         logger: &Logger,
     ) -> Result<Vec<u8>> {
-        let queries: HashMap<u64, QueryMsg> = network
+        let queries: Vec<(u64, QueryMsg)> = network
             .peers()
             .into_iter()
             .map(|p| {
                 let query = QueryMsg::ReadFrags {
+                    id: Uuid::new_v4(),
                     from: client_id,
                     file_name: file_name.to_string(),
                 };
@@ -333,14 +300,15 @@ mod test {
         let mut frags = HashMap::new();
 
         while !queries.lock().unwrap().is_empty() {
-            let res = network
-                .get_client_receiver(client_id)
-                .lock()
-                .unwrap()
-                .recv_timeout(CLIENT_TIMEOUT);
+            let query_id = match queries.lock().unwrap().last().unwrap() {
+                (_, QueryMsg::ReadFrags { id, .. }) => *id,
+                _ => panic!("Incorrect request variant recieved"),
+            };
+
+            let res = network.wait_for_response_timeout(query_id, CLIENT_TIMEOUT);
 
             assert!(
-                res.is_ok(),
+                res.is_some(),
                 "Client {client_id} waited too long for response"
             );
 
@@ -354,7 +322,8 @@ mod test {
                         frags.insert(frag.file_idx, frag);
                     }
 
-                    queries.lock().unwrap().remove(&res.from);
+                    let last = queries.lock().unwrap().len() - 1;
+                    queries.lock().unwrap().remove(last);
                 }
                 _ => panic!("Incorrect response variant recieved"),
             }

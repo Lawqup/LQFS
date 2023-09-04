@@ -43,7 +43,6 @@ impl NodeStorageCore {
     pub fn restore(id: u64) -> Result<Self> {
         let path = format!("store/node-{id}/raft.mdb");
 
-        println!("Restoring {path}");
         let persy: Persy = Persy::open(path, persy::Config::new())?;
 
         Ok(Self { persy })

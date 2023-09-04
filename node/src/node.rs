@@ -165,7 +165,7 @@ impl Node {
             loop {
                 match network
                     .get_node_reciever(self.id)
-                    .lock()
+                    .try_lock()
                     .unwrap()
                     .try_recv()
                 {
@@ -180,16 +180,22 @@ impl Node {
                         }
                     }
                     Ok(RequestMsg::Query(q)) => match q {
-                        QueryMsg::IsInitialized { from } => {
+                        QueryMsg::IsInitialized { id, from } => {
                             self.network.respond_to_client(Response {
+                                id,
                                 to: from,
                                 from: self.id,
-                                msg: ResponseMsg::Initialized(self.raft.is_some()),
+                                msg: ResponseMsg::IsInitialized(self.raft.is_some()),
                             });
                         }
-                        QueryMsg::ReadFrags { from, file_name } => {
+                        QueryMsg::ReadFrags {
+                            id,
+                            from,
+                            file_name,
+                        } => {
                             debug!(self.logger, "GOT READ FRAGS QUERY FROM {from}");
                             self.network.respond_to_client(Response {
+                                id,
                                 to: from,
                                 from: self.id,
                                 msg: ResponseMsg::Frags(self.fs.get_frags(&file_name).unwrap()),
@@ -216,6 +222,8 @@ impl Node {
             if elapsed >= Self::TICK_COOLDOWN {
                 now = Instant::now();
                 raft.tick();
+
+                debug!(self.logger, "TICK");
 
                 if let Some(follower) = self.followers_to_add.get(0) {
                     let conf_change = ConfChange {
@@ -253,12 +261,10 @@ impl Node {
         if index_before == self.raft_mut().raft.raft_log.last_index() && prop.is_fragment() {
             // Fragment proposals come from client, so respond over network
             let resp = Response {
+                id: prop.id,
                 to: prop.from,
                 from: self.id,
-                msg: ResponseMsg::Proposed {
-                    proposal_id: prop.id,
-                    success: false,
-                },
+                msg: ResponseMsg::IsProposed(false),
             };
             self.network.respond_to_client(resp);
         }
@@ -311,7 +317,9 @@ impl Node {
                 .expect("Could not update hard state");
         }
 
-        self.network.send_raft_messages(light_rd.take_messages());
+        if !light_rd.messages().is_empty() {
+            self.network.send_raft_messages(light_rd.take_messages());
+        }
 
         self.handle_commited_entries(light_rd.take_committed_entries());
 
@@ -359,12 +367,10 @@ impl Node {
             if self.raft_mut().raft.state == StateRole::Leader {
                 if entry.get_entry_type() == EntryType::EntryNormal {
                     let resp = Response {
+                        id: prop_id,
                         to: prop_from,
                         from: self.id,
-                        msg: ResponseMsg::Proposed {
-                            proposal_id: prop_id,
-                            success: true,
-                        },
+                        msg: ResponseMsg::IsProposed(true),
                     };
                     self.network.respond_to_client(resp);
                 } else {
