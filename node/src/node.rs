@@ -138,8 +138,8 @@ impl Node {
         let mut config = Self::config();
         config.id = msg.to;
 
-        fs::create_dir(format!("store/node-{}/", self.id))
-            .expect("Could not create storage directory");
+        fs::create_dir_all(format!("store/node-{}/", self.id))
+            .expect("Could not create fragment storage directory");
         let storage = NodeStorage::create(self.id)?;
         self.raft = Some(RawNode::new(&config, storage, &self.logger)?);
         Ok(())
@@ -180,12 +180,14 @@ impl Node {
                         }
                     }
                     Ok(RequestMsg::Query(q)) => match q {
-                        QueryMsg::IsInitialized { id, from } => {
+                        QueryMsg::GetRaftState { id, from } => {
                             self.network.respond_to_client(Response {
                                 id,
                                 to: from,
                                 from: self.id,
-                                msg: ResponseMsg::IsInitialized(self.raft.is_some()),
+                                msg: ResponseMsg::RaftState(
+                                    self.raft.as_ref().map(|r| r.raft.state),
+                                ),
                             });
                         }
                         QueryMsg::ReadFrags {

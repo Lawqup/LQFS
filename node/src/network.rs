@@ -5,7 +5,7 @@ use crate::{
     prelude::*,
     service::{query_server, ReadFragsRequest, ReadFragsResponse},
 };
-use raft::prelude::Message;
+use raft::{prelude::Message, StateRole};
 use tonic::Status;
 use uuid::Uuid;
 
@@ -34,7 +34,7 @@ pub enum RequestMsg {
 
 #[derive(Debug, Clone)]
 pub enum QueryMsg {
-    IsInitialized {
+    GetRaftState {
         id: Uuid,
         from: u64,
     },
@@ -53,7 +53,8 @@ pub enum Signal {
 #[derive(Debug, Clone)]
 pub enum ResponseMsg {
     IsProposed(bool),
-    IsInitialized(bool),
+    /// The raft state. If the raft isn't initialized yet, is None.
+    RaftState(Option<StateRole>),
     Frags(Vec<Fragment>),
 }
 
@@ -117,7 +118,6 @@ impl NetworkController {
     }
 
     pub fn send_raft_messages(&self, msgs: Vec<Message>) {
-        error!(self.logger, "SENDING MESSAGES {msgs:?}");
         for msg in msgs {
             let to = msg.to;
             let from = msg.from;

@@ -60,24 +60,32 @@ fn wait_until_cluster_initialized(clients: &[u64], peers: &[u64], network: Netwo
         .map(|node| (node, Uuid::new_v4()))
         .collect();
 
+    let mut n_leaders = 0;
     while !still_uninit.is_empty() {
         let mut to_remove = Vec::new();
 
         for (node, query_id) in still_uninit.iter().copied() {
             network.send_query_message(
                 node,
-                QueryMsg::IsInitialized {
+                QueryMsg::GetRaftState {
                     id: query_id,
                     from: technician,
                 },
             );
 
             match network.wait_for_response(query_id).msg {
-                ResponseMsg::IsInitialized(true) => {
-                    to_remove.push((node, query_id));
+                ResponseMsg::RaftState(Some(raft::StateRole::Leader)) => {
+                    n_leaders += 1;
+                    if n_leaders == 1 {
+                        to_remove.push((node, query_id));
+                    }
                 }
-                ResponseMsg::IsInitialized(false) => (),
-                _ => panic!("Incorrect response variant recieved"),
+                ResponseMsg::RaftState(Some(_)) => {
+                    if n_leaders == 1 {
+                        to_remove.push((node, query_id));
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -88,6 +96,8 @@ fn wait_until_cluster_initialized(clients: &[u64], peers: &[u64], network: Netwo
 
         thread::sleep(Duration::from_millis(200));
     }
+
+    assert_eq!(n_leaders, 1);
 }
 
 /// Restores the cluster from persistent storage.
