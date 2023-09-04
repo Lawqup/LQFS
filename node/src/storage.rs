@@ -1,16 +1,17 @@
-use std::{cmp::Ordering, sync::Arc};
+use std::{cmp::Ordering, path::Path, sync::Arc};
 
-use persy::{ByteVec, Persy, Transaction, TxIndexIter, ValueMode};
 use prost::Message as PRMessage;
 use raft::{prelude::*, Storage};
+use sled::{Db, Tree};
 
-use crate::prelude::Result;
+use crate::prelude::*;
 
 pub struct NodeStorageCore {
-    persy: Persy,
+    db: Db,
+    entries_tree: Tree,
 }
 
-const ENTRIES_INDEX: &str = "snapshot";
+const ENTRIES_TREE: &str = "snapshot";
 const METADATA_INDEX: &str = "metadata";
 
 const SNAPSHOT_METADATA_KEY: &str = "snapshot";
@@ -19,82 +20,63 @@ const CONF_STATE_KEY: &str = "conf_state";
 
 impl NodeStorageCore {
     pub fn create(id: u64) -> Result<Self> {
-        let path = format!("store/node-{id}/raft.mdb");
+        let path = format!("store/metadata-{id}/");
 
         println!("CREATING {path}");
-        Persy::create(&path)?;
-        let persy: Persy = Persy::open(path, persy::Config::new())?;
-        let mut tx = persy.begin()?;
+        let db = sled::open(path)?;
 
-        let store = Self { persy };
+        let entries_tree = db.open_tree(ENTRIES_TREE)?;
 
-        tx.create_index::<u64, ByteVec>(ENTRIES_INDEX, ValueMode::Replace)?;
-        tx.create_index::<String, ByteVec>(METADATA_INDEX, ValueMode::Replace)?;
+        let store = Self { db, entries_tree };
+        store.set_hard_state(&HardState::default())?;
+        store.set_conf_state(&ConfState::default())?;
+        store.set_snapshot_metadata(&SnapshotMetadata::default())?;
 
-        store.set_hard_state(&mut tx, &HardState::default())?;
-        store.set_conf_state(&mut tx, &ConfState::default())?;
-        store.set_snapshot_metadata(&mut tx, &SnapshotMetadata::default())?;
-
-        tx.prepare()?.commit()?;
+        store.db.flush()?;
 
         Ok(store)
     }
 
     pub fn restore(id: u64) -> Result<Self> {
-        let path = format!("store/node-{id}/raft.mdb");
+        let path = format!("store/metadata-{id}/");
 
-        let persy: Persy = Persy::open(path, persy::Config::new())?;
+        if !Path::new(&path).exists() {
+            return Err(Error::InitError);
+        }
 
-        Ok(Self { persy })
+        let db = sled::open(path.clone())?;
+
+        let entries_tree = db.open_tree(ENTRIES_TREE)?;
+
+        Ok(Self { db, entries_tree })
     }
 
-    pub fn set_hard_state(&self, tx: &mut Transaction, hard_state: &HardState) -> Result<()> {
-        tx.remove::<String, ByteVec>(METADATA_INDEX, HARD_STATE_KEY.to_string(), None)?;
-
-        tx.put::<String, ByteVec>(
-            METADATA_INDEX,
-            HARD_STATE_KEY.to_string(),
-            hard_state.encode_to_vec().into(),
-        )?;
+    pub fn set_hard_state(&self, hard_state: &HardState) -> Result<()> {
+        self.db.insert(HARD_STATE_KEY, hard_state.encode_to_vec())?;
 
         Ok(())
     }
 
-    pub fn set_conf_state(&self, tx: &mut Transaction, conf_state: &ConfState) -> Result<()> {
-        tx.remove::<String, ByteVec>(METADATA_INDEX, CONF_STATE_KEY.to_string(), None)?;
-
-        tx.put::<String, ByteVec>(
-            METADATA_INDEX,
-            CONF_STATE_KEY.to_string(),
-            conf_state.encode_to_vec().into(),
-        )?;
+    pub fn set_conf_state(&self, conf_state: &ConfState) -> Result<()> {
+        self.db.insert(CONF_STATE_KEY, conf_state.encode_to_vec())?;
 
         Ok(())
     }
 
-    pub fn set_snapshot_metadata(
-        &self,
-        tx: &mut Transaction,
-        metadata: &SnapshotMetadata,
-    ) -> Result<()> {
-        tx.remove::<String, ByteVec>(METADATA_INDEX, SNAPSHOT_METADATA_KEY.to_string(), None)?;
-
-        tx.put::<String, ByteVec>(
-            METADATA_INDEX,
-            SNAPSHOT_METADATA_KEY.to_string(),
-            metadata.encode_to_vec().into(),
-        )?;
+    pub fn set_snapshot_metadata(&self, metadata: &SnapshotMetadata) -> Result<()> {
+        self.db
+            .insert(SNAPSHOT_METADATA_KEY, metadata.encode_to_vec())?;
 
         Ok(())
     }
 
-    pub fn append_entries(&self, tx: &mut Transaction, entries: &[Entry]) -> Result<()> {
+    pub fn append_entries(&self, entries: &[Entry]) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
 
-        let first_index = self.get_first_index(tx)?;
-        let last_index = self.get_last_index(tx)?;
+        let first_index = self.get_first_index()?;
+        let last_index = self.get_last_index()?;
 
         if first_index > entries[0].index {
             panic!(
@@ -112,50 +94,54 @@ impl NodeStorageCore {
         }
 
         for index in entries[0].index..=last_index {
-            tx.remove::<u64, ByteVec>(ENTRIES_INDEX, index, None)?;
+            self.entries_tree.remove(index.to_be_bytes())?;
         }
 
         for entry in entries {
             let index = entry.index;
-            tx.put::<u64, ByteVec>(ENTRIES_INDEX, index, entry.encode_to_vec().into())?;
+            self.entries_tree
+                .insert(index.to_be_bytes(), entry.encode_to_vec())?;
         }
 
         Ok(())
     }
 
-    pub fn get_hard_state(&self, tx: &mut Transaction) -> Result<HardState> {
-        let data = &tx
-            .get::<String, ByteVec>(METADATA_INDEX, &HARD_STATE_KEY.into())?
-            .next()
-            .unwrap();
-
-        Ok(HardState::decode(data.to_vec().as_slice())?)
+    pub fn get_hard_state(&self) -> Result<HardState> {
+        Ok(HardState::decode(
+            self.db
+                .get(HARD_STATE_KEY)?
+                .expect("Hard state didn't exist")
+                .to_vec()
+                .as_slice(),
+        )?)
     }
 
-    pub fn get_conf_state(&self, tx: &mut Transaction) -> Result<ConfState> {
-        let data = &tx
-            .get::<String, ByteVec>(METADATA_INDEX, &CONF_STATE_KEY.into())?
-            .next()
-            .unwrap();
-
-        Ok(ConfState::decode(data.to_vec().as_slice())?)
+    pub fn get_conf_state(&self) -> Result<ConfState> {
+        Ok(ConfState::decode(
+            self.db
+                .get(CONF_STATE_KEY)?
+                .expect("Conf state didn't exist")
+                .to_vec()
+                .as_slice(),
+        )?)
     }
 
-    pub fn get_snapshot_metadata(&self, tx: &mut Transaction) -> Result<SnapshotMetadata> {
-        let data = &tx
-            .get::<String, ByteVec>(METADATA_INDEX, &SNAPSHOT_METADATA_KEY.into())?
-            .next()
-            .unwrap();
-
-        Ok(SnapshotMetadata::decode(data.to_vec().as_slice())?)
+    pub fn get_snapshot_metadata(&self) -> Result<SnapshotMetadata> {
+        Ok(SnapshotMetadata::decode(
+            self.db
+                .get(SNAPSHOT_METADATA_KEY)?
+                .expect("Snapshot metadata did not exist")
+                .to_vec()
+                .as_slice(),
+        )?)
     }
 
-    pub fn get_snapshot(&self, tx: &mut Transaction) -> Result<Snapshot> {
+    pub fn get_snapshot(&self) -> Result<Snapshot> {
         let mut snapshot = Snapshot::default();
 
         let meta = snapshot.mut_metadata();
-        let self_meta = self.get_snapshot_metadata(tx)?;
-        meta.index = self.get_hard_state(tx)?.commit;
+        let self_meta = self.get_snapshot_metadata()?;
+        meta.index = self.get_hard_state()?.commit;
         meta.term = match meta.index.cmp(&self_meta.index) {
             Ordering::Less => {
                 panic!(
@@ -164,36 +150,32 @@ impl NodeStorageCore {
                 )
             }
             Ordering::Equal => self_meta.term,
-            Ordering::Greater => self.get_entry(meta.index, tx)?.term,
+            Ordering::Greater => self.get_entry(meta.index)?.term,
         };
 
-        meta.set_conf_state(self.get_conf_state(tx)?);
+        meta.set_conf_state(self.get_conf_state()?);
         Ok(snapshot)
     }
 
-    pub fn get_last_index(&self, tx: &mut Transaction) -> Result<u64> {
-        let iter: TxIndexIter<u64, ByteVec> = tx.range(ENTRIES_INDEX, ..)?;
-
-        if let Some(mut e) = iter.last() {
-            let e = Entry::decode(e.1.next().unwrap().to_vec().as_slice())
+    pub fn get_last_index(&self) -> Result<u64> {
+        if let Ok(Some(e)) = self.entries_tree.last() {
+            let e = Entry::decode(e.1.to_vec().as_slice())
                 .expect("Entry bytes should not be malformed.");
 
             Ok(e.index)
         } else {
-            Ok(self.get_snapshot_metadata(tx)?.index)
+            Ok(self.get_snapshot_metadata()?.index)
         }
     }
 
-    pub fn get_first_index(&self, tx: &mut Transaction) -> Result<u64> {
-        let mut iter: TxIndexIter<u64, ByteVec> = tx.range(ENTRIES_INDEX, ..)?;
-
-        if let Some(mut e) = iter.next() {
-            let e = Entry::decode(e.1.next().unwrap().to_vec().as_slice())
+    pub fn get_first_index(&self) -> Result<u64> {
+        if let Ok(Some(e)) = self.entries_tree.first() {
+            let e = Entry::decode(e.1.to_vec().as_slice())
                 .expect("Entry bytes should not be malformed.");
 
             Ok(e.index)
         } else {
-            Ok(self.get_snapshot_metadata(tx)?.index + 1)
+            Ok(self.get_snapshot_metadata()?.index + 1)
         }
     }
 
@@ -202,19 +184,24 @@ impl NodeStorageCore {
         low: u64,
         high: u64,
         max_size: impl Into<Option<u64>>,
-        tx: &mut Transaction,
     ) -> Result<Vec<Entry>> {
-        assert!(!self.get_last_index(tx)? + 1 >= high);
+        assert!(!self.get_last_index()? + 1 >= high);
 
-        let iter: TxIndexIter<u64, ByteVec> = tx.range(ENTRIES_INDEX, low..high)?;
         let mut total_bytes = 0;
         let max_size = max_size.into();
 
         let mut res = Vec::new();
 
-        for (i, (_, mut e)) in iter.enumerate() {
-            let entry = Entry::decode(e.next().unwrap().to_vec().as_slice())
-                .expect("Entry bytes should not be malformed.");
+        for (i, ent) in self
+            .entries_tree
+            .range(low.to_be_bytes()..high.to_be_bytes())
+            .enumerate()
+        {
+            let entry = match ent {
+                Ok((_, e)) => Entry::decode(e.to_vec().as_slice())
+                    .expect("Entry bytes should not be malformed."),
+                Err(e) => return Err(e.into()),
+            };
 
             total_bytes += entry.encoded_len() as u64;
 
@@ -228,27 +215,28 @@ impl NodeStorageCore {
         Ok(res)
     }
 
-    pub fn get_entry(&self, index: u64, tx: &mut Transaction) -> Result<Entry> {
-        let data = tx
-            .get::<u64, ByteVec>(ENTRIES_INDEX, &index)?
-            .next()
-            .ok_or(raft::Error::Store(raft::StorageError::Unavailable))?;
-
-        Ok(Entry::decode(data.to_vec().as_slice())?)
+    pub fn get_entry(&self, index: u64) -> Result<Entry> {
+        Ok(Entry::decode(
+            self.entries_tree
+                .get(index.to_be_bytes())?
+                .expect("Entry didn't exist")
+                .to_vec()
+                .as_slice(),
+        )?)
     }
 
     #[cfg(test)]
     fn set_entries(&self, entries: &[Entry]) -> Result<()> {
-        let mut tx = self.persy.begin()?;
-        tx.drop_index(ENTRIES_INDEX)?;
-        tx.create_index::<u64, ByteVec>(ENTRIES_INDEX, ValueMode::Exclusive)?;
+        self.entries_tree.clear()?;
 
         for entry in entries {
             let index = entry.index;
-            tx.put::<u64, ByteVec>(ENTRIES_INDEX, index, entry.encode_to_vec().into())?;
+            self.entries_tree
+                .insert(index.to_be_bytes(), entry.encode_to_vec())?;
         }
 
-        tx.prepare()?.commit()?;
+        self.entries_tree.flush()?;
+        self.db.flush()?;
         Ok(())
     }
 }
@@ -271,17 +259,13 @@ impl NodeStorage {
 impl Storage for NodeStorage {
     fn initial_state(&self) -> raft::Result<RaftState> {
         let store = &self.0;
-        let mut tx = store
-            .persy
-            .begin()
-            .map_err(|e| raft::Error::Store(raft::StorageError::Other(e.into())))?;
 
         let state = RaftState {
             hard_state: store
-                .get_hard_state(&mut tx)
+                .get_hard_state()
                 .map_err(|e| raft::Error::Store(raft::StorageError::Other(e.into())))?,
             conf_state: store
-                .get_conf_state(&mut tx)
+                .get_conf_state()
                 .map_err(|e| raft::Error::Store(raft::StorageError::Other(e.into())))?,
         };
 
@@ -296,39 +280,31 @@ impl Storage for NodeStorage {
         _context: raft::GetEntriesContext,
     ) -> raft::Result<Vec<Entry>> {
         let store = &self.0;
-        let mut tx = store
-            .persy
-            .begin()
-            .map_err(|e| raft::Error::Store(raft::StorageError::Other(e.into())))?;
 
         if low
             < store
-                .get_first_index(&mut tx)
+                .get_first_index()
                 .map_err(|_| raft::Error::Store(raft::StorageError::Unavailable))?
         {
             return Err(raft::Error::Store(raft::StorageError::Compacted));
         }
 
         store
-            .get_entries(low, high, max_size, &mut tx)
+            .get_entries(low, high, max_size)
             .map_err(|e| raft::Error::Store(raft::StorageError::Other(e.into())))
     }
 
     fn term(&self, idx: u64) -> raft::Result<u64> {
         let store = &self.0;
-        let mut tx = store
-            .persy
-            .begin()
-            .map_err(|_| raft::Error::Store(raft::StorageError::Unavailable))?;
 
         let first_index = store
-            .get_first_index(&mut tx)
+            .get_first_index()
             .map_err(|_| raft::Error::Store(raft::StorageError::Unavailable))?;
         let last_index = store
-            .get_last_index(&mut tx)
+            .get_last_index()
             .map_err(|_| raft::Error::Store(raft::StorageError::Unavailable))?;
         let hs = store
-            .get_hard_state(&mut tx)
+            .get_hard_state()
             .map_err(|_| raft::Error::Store(raft::StorageError::Unavailable))?;
 
         if idx == hs.commit {
@@ -339,7 +315,7 @@ impl Storage for NodeStorage {
             Err(raft::Error::Store(raft::StorageError::Unavailable))
         } else {
             store
-                .get_entry(idx, &mut tx)
+                .get_entry(idx)
                 .map_err(|_| raft::Error::Store(raft::StorageError::Unavailable))
                 .map(|e| e.term)
         }
@@ -347,37 +323,22 @@ impl Storage for NodeStorage {
 
     fn first_index(&self) -> raft::Result<u64> {
         let store = &self.0;
-        let mut tx = store
-            .persy
-            .begin()
-            .map_err(|_| raft::Error::Store(raft::StorageError::Unavailable))?;
-
         store
-            .get_first_index(&mut tx)
+            .get_first_index()
             .map_err(|_| raft::Error::Store(raft::StorageError::Unavailable))
     }
 
     fn last_index(&self) -> raft::Result<u64> {
         let store = &self.0;
-        let mut tx = store
-            .persy
-            .begin()
-            .map_err(|_| raft::Error::Store(raft::StorageError::Unavailable))?;
-
         store
-            .get_last_index(&mut tx)
+            .get_last_index()
             .map_err(|_| raft::Error::Store(raft::StorageError::Unavailable))
     }
 
     fn snapshot(&self, request_index: u64, _to: u64) -> raft::Result<Snapshot> {
         let store = &self.0;
-        let mut tx = store
-            .persy
-            .begin()
-            .map_err(|_| raft::Error::Store(raft::StorageError::Unavailable))?;
-
         let mut snap = store
-            .get_snapshot(&mut tx)
+            .get_snapshot()
             .map_err(|_| raft::Error::Store(raft::StorageError::SnapshotTemporarilyUnavailable))?;
 
         if snap.get_metadata().index < request_index {
@@ -401,41 +362,36 @@ pub trait LogStore: Storage {
 impl LogStore for NodeStorage {
     fn append(&self, entries: &[Entry]) -> Result<()> {
         let store = &self.0;
-        let mut tx = store.persy.begin()?;
-
         dbg!(entries);
-        store.append_entries(&mut tx, entries)?;
+        store.append_entries(entries)?;
 
-        tx.prepare()?.commit()?;
+        store.entries_tree.flush()?;
         Ok(())
     }
 
     fn set_hard_state(&self, hard_state: &HardState) -> Result<()> {
         let store = &self.0;
-        let mut tx = store.persy.begin()?;
 
-        store.set_hard_state(&mut tx, hard_state)?;
+        store.set_hard_state(hard_state)?;
 
-        tx.prepare()?.commit()?;
+        store.db.flush()?;
         Ok(())
     }
 
     fn set_conf_state(&self, conf_state: &ConfState) -> Result<()> {
         let store = &self.0;
-        let mut tx = store.persy.begin()?;
 
-        store.set_conf_state(&mut tx, conf_state)?;
+        store.set_conf_state(conf_state)?;
 
-        tx.prepare()?.commit()?;
+        store.db.flush()?;
         Ok(())
     }
 
     fn create_snapshot(&self, data: Vec<u8>) -> Result<()> {
         let store = &self.0;
-        let mut tx = store.persy.begin()?;
 
-        let hard_state = store.get_hard_state(&mut tx)?;
-        let conf_state = store.get_conf_state(&mut tx)?;
+        let hard_state = store.get_hard_state()?;
+        let conf_state = store.get_conf_state()?;
 
         let mut snapshot = Snapshot::default();
         snapshot.set_data(data);
@@ -445,58 +401,54 @@ impl LogStore for NodeStorage {
         metadata.set_index(hard_state.commit);
         metadata.set_term(hard_state.term);
 
-        store.set_snapshot_metadata(&mut tx, metadata)?;
+        store.set_snapshot_metadata(metadata)?;
 
-        tx.prepare()?.commit()?;
+        store.db.flush()?;
         Ok(())
     }
 
     fn apply_snapshot(&self, snapshot: Snapshot) -> Result<()> {
         let store = &self.0;
-        let mut tx = store.persy.begin()?;
 
         let metadata = snapshot.get_metadata();
 
-        if self.0.get_first_index(&mut tx)? > metadata.index {
+        if self.0.get_first_index()? > metadata.index {
             Err(raft::Error::Store(raft::StorageError::SnapshotOutOfDate))?;
         }
 
         let conf_state = metadata.get_conf_state();
-        let mut hard_state = store.get_hard_state(&mut tx)?;
+        let mut hard_state = store.get_hard_state()?;
 
         hard_state.set_term(metadata.term);
         hard_state.set_commit(metadata.index);
 
-        store.set_hard_state(&mut tx, &hard_state)?;
-        store.set_conf_state(&mut tx, conf_state)?;
-        store.set_snapshot_metadata(&mut tx, metadata)?;
+        store.set_hard_state(&hard_state)?;
+        store.set_conf_state(conf_state)?;
+        store.set_snapshot_metadata(metadata)?;
 
-        tx.prepare()?.commit()?;
+        store.db.flush()?;
         Ok(())
     }
 
     fn compact(&self, index: u64) -> Result<()> {
         let store = &self.0;
-        let mut tx = store.persy.begin()?;
 
-        let last_index = store.get_last_index(&mut tx)?;
+        let last_index = store.get_last_index()?;
         assert!(last_index >= index);
 
         for i in 0..index {
-            tx.remove::<u64, ByteVec>(ENTRIES_INDEX, i, None)?;
+            store.entries_tree.remove(i.to_be_bytes())?;
         }
 
-        tx.prepare()?.commit()?;
+        store.entries_tree.flush()?;
         Ok(())
     }
 
     fn get_hard_state(&self) -> Result<HardState> {
         let store = &self.0;
-        let mut tx = store.persy.begin()?;
 
-        let hard_state = store.get_hard_state(&mut tx)?;
+        let hard_state = store.get_hard_state()?;
 
-        tx.prepare()?.commit()?;
         Ok(hard_state)
     }
 }
@@ -624,7 +576,7 @@ mod test {
         for (i, (lo, hi, maxsize, wentries)) in tests.drain(..).enumerate() {
             in_temp_dir!({
                 let storage = NodeStorage::create(1).unwrap();
-                storage.0.set_entries(&ents).unwrap();
+                storage.0.set_entries(ents.as_slice()).unwrap();
 
                 let e = storage.entries(lo, hi, maxsize, GetEntriesContext::empty(false));
                 if e != wentries {
@@ -755,7 +707,6 @@ mod test {
         for (i, (entries, wentries)) in tests.drain(..).enumerate() {
             in_temp_dir!({
                 let storage = NodeStorage::create(1).unwrap();
-                let mut tx = storage.0.persy.begin().unwrap();
                 storage.0.set_entries(&ents).unwrap();
 
                 let res = panic::catch_unwind(AssertUnwindSafe(|| storage.append(&entries)));
@@ -763,7 +714,7 @@ mod test {
                     let _ = res.unwrap();
                     let e = &storage
                         .0
-                        .get_entries(0, storage.last_index().unwrap() + 1, None, &mut tx)
+                        .get_entries(0, storage.last_index().unwrap() + 1, None)
                         .unwrap();
 
                     if *e != wentries {

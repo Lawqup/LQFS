@@ -5,7 +5,6 @@ use raft::{prelude::*, Config, RawNode, StateRole};
 use std::{
     collections::VecDeque,
     fs,
-    path::Path,
     sync::mpsc::TryRecvError,
     time::{Duration, Instant},
 };
@@ -54,11 +53,10 @@ impl Node {
 
         info!(logger, "RESTORING");
 
-        let path = &format!("store/node-{id}/");
-        let path = Path::new(path);
+        fs::create_dir_all(format!("store/node-{id}/"))
+            .expect("Could not create fragment storage directory");
 
-        path.exists().then_some(()).ok_or(Error::InitError)?;
-        let storage = NodeStorage::restore(id).expect("Could not restore node storage");
+        let storage = NodeStorage::restore(id)?;
 
         let mut config = Self::config();
         config.id = id;
@@ -89,7 +87,9 @@ impl Node {
         s.mut_metadata().term = 1;
         s.mut_metadata().mut_conf_state().voters = vec![id];
 
-        fs::create_dir(format!("store/node-{id}/")).expect("Could not create storage directory");
+        fs::create_dir_all(format!("store/node-{id}/"))
+            .expect("Could not create fragment storage directory");
+
         let storage = NodeStorage::create(id).expect("Could not create node storage");
         storage.apply_snapshot(s).unwrap();
 
@@ -281,7 +281,7 @@ impl Node {
         let store = raft.store().clone();
 
         if !ready.entries().is_empty() {
-            store.append(ready.entries()).unwrap();
+            store.append(ready.entries().as_slice()).unwrap();
         }
 
         if let Some(hs) = ready.hs() {

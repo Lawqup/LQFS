@@ -72,7 +72,7 @@ pub enum Error {
     #[error("io error: `{0}`")]
     Io(#[from] std::io::Error),
     #[error("database error: `{0}`")]
-    Database(#[from] persy::PersyError),
+    Database(#[from] sled::Error),
     #[error("decode error: `{0}`")]
     DecodeError(#[from] prost::DecodeError),
     #[error("encode error: `{0}`")]
@@ -87,12 +87,6 @@ pub enum Error {
     KeyError,
     #[error("entire file couldn't be retrieved")]
     FileRetrievalError,
-}
-
-impl<T: Into<persy::PersyError>> From<persy::PE<T>> for Error {
-    fn from(err: persy::PE<T>) -> Error {
-        Error::Database(err.error().into())
-    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
