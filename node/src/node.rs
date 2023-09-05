@@ -10,8 +10,8 @@ use std::{
 };
 
 use crate::{
-    frag::{FSManager, Fragment},
-    network::{Network, QueryMsg, RequestMsg, Response, ResponseMsg, Signal},
+    frag::FSManager,
+    network::{Network, Proposal, Request, RequestMsg, Response, ResponseMsg},
     prelude::*,
     storage::{LogStore, NodeStorage},
 };
@@ -53,9 +53,6 @@ impl Node {
 
         info!(logger, "RESTORING");
 
-        fs::create_dir_all(format!("store/node-{id}/"))
-            .expect("Could not create fragment storage directory");
-
         let storage = NodeStorage::restore(id)?;
 
         let mut config = Self::config();
@@ -64,6 +61,9 @@ impl Node {
         config.validate().expect("Raft config should be valid");
 
         let raft = Some(RawNode::new(&config, storage, &logger).unwrap());
+
+        fs::create_dir_all(format!("store/node-{id}/"))
+            .expect("Could not create fragment storage directory");
 
         Ok(Self {
             raft,
@@ -87,9 +87,6 @@ impl Node {
         s.mut_metadata().term = 1;
         s.mut_metadata().mut_conf_state().voters = vec![id];
 
-        fs::create_dir_all(format!("store/node-{id}/"))
-            .expect("Could not create fragment storage directory");
-
         let storage = NodeStorage::create(id).expect("Could not create node storage");
         storage.apply_snapshot(s).unwrap();
 
@@ -105,6 +102,10 @@ impl Node {
 
         raft.as_mut().unwrap().raft.become_candidate();
         raft.as_mut().unwrap().raft.become_leader();
+
+        fs::create_dir_all(format!("store/node-{id}/"))
+            .expect("Could not create fragment storage directory");
+
         Self {
             raft,
             fs: FSManager::new(id),
@@ -163,56 +164,59 @@ impl Node {
             // Keep recieving until there's nothing ready yet,
             // in which case stop recieving to drive the raft
             loop {
-                match network
+                let Request { id, req } = match network
                     .get_node_reciever(self.id)
                     .try_lock()
                     .unwrap()
                     .try_recv()
                 {
-                    Ok(RequestMsg::Raft(m)) => {
+                    Ok(r) => r,
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => return,
+                };
+                match req {
+                    RequestMsg::DriveRaft(m) => {
                         info!(self.logger, "Recieved raft message {m:?}");
                         self.step(m);
                     }
-                    Ok(RequestMsg::Propose(p)) => {
+                    RequestMsg::Propose(p) => {
                         if self.is_leader() {
-                            info!(self.logger, "Recieved proposal from {}", p.from);
-                            self.propose(&p);
+                            info!(self.logger, "Recieved proposal ");
+                            self.propose(id, p);
                         }
                     }
-                    Ok(RequestMsg::Query(q)) => match q {
-                        QueryMsg::GetRaftState { id, from } => {
-                            self.network.respond_to_client(Response {
-                                id,
-                                to: from,
-                                from: self.id,
-                                msg: ResponseMsg::RaftState(
-                                    self.raft.as_ref().map(|r| r.raft.state),
-                                ),
-                            });
-                        }
-                        QueryMsg::ReadFrags {
+                    RequestMsg::GetRaftState(r) => {
+                        self.network.respond_to_client(Response {
                             id,
-                            from,
-                            file_name,
-                        } => {
-                            debug!(self.logger, "GOT READ FRAGS QUERY FROM {from}");
-                            self.network.respond_to_client(Response {
-                                id,
-                                to: from,
-                                from: self.id,
-                                msg: ResponseMsg::Frags(self.fs.get_frags(&file_name).unwrap()),
-                            });
-                        }
-                    },
-                    Ok(RequestMsg::Control(ctl)) => match ctl {
-                        Signal::Shutdown => {
-                            info!(self.logger, "Shutting down");
-                            return;
-                        }
-                    },
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => return,
-                }
+                            res: ResponseMsg::RaftState(RaftStateResponse {
+                                is_initialized: self.raft.is_some(),
+                                is_leader: self.is_leader(),
+                            }),
+                        });
+                    }
+                    RequestMsg::ReadFrags(r) => {
+                        debug!(self.logger, "GOT READ FRAGS QUERY");
+                        self.network.respond_to_client(Response {
+                            id,
+                            res: ResponseMsg::Frags(ReadFragsResponse {
+                                frags: self.fs.get_frags(&r.file_name).unwrap(),
+                            }),
+                        });
+                    }
+                    RequestMsg::ReadFileNames => {
+                        debug!(self.logger, "GOT READ FILE NAME QUERY");
+                        self.network.respond_to_client(Response {
+                            id,
+                            res: ResponseMsg::FileNames(ReadFileNamesResponse {
+                                file_names: self.fs.get_file_names().unwrap(),
+                            }),
+                        });
+                    }
+                    RequestMsg::ShutdownNode(r) => {
+                        info!(self.logger, "Shutting down");
+                        return;
+                    }
+                };
             }
 
             let raft = match &mut self.raft {
@@ -234,8 +238,8 @@ impl Node {
                         ..Default::default()
                     };
 
-                    let prop = Proposal::new_conf_change(self.id, conf_change);
-                    self.propose(&prop);
+                    let prop = Proposal::ConfChange(conf_change);
+                    self.propose(Uuid::new_v4(), prop);
                 }
             }
 
@@ -249,27 +253,28 @@ impl Node {
             .is_some_and(|r| r.raft.state == StateRole::Leader)
     }
 
-    fn propose(&mut self, prop: &Proposal) {
-        let index_before = self.raft_mut().raft.raft_log.last_index();
-        let ctx = prop.context_bytes();
-        if let Some(frag) = &prop.fragment {
-            let bytes = frag.encode_to_vec();
-            let _ = self.raft_mut().propose(ctx, bytes);
-        } else if let Some(cc) = &prop.conf_change {
-            let _ = self.raft_mut().propose_conf_change(ctx, cc.clone());
+    fn propose(&mut self, req_id: Uuid, prop: Proposal) {
+        let context = req_id.as_bytes().to_vec();
+        match prop {
+            Proposal::WriteFrag(frag) => {
+                let index_before = self.raft_mut().raft.raft_log.last_index();
+                let _ = self.raft_mut().propose(context, frag.encode_to_vec());
+
+                if index_before == self.raft_mut().raft.raft_log.last_index() {
+                    // Fragment proposals come from client, so respond over network
+                    let resp = Response {
+                        id: req_id,
+                        res: ResponseMsg::WriteFragSuccess(WriteFragResponse { success: false }),
+                    };
+                    self.network.respond_to_client(resp);
+                };
+            }
+            Proposal::ConfChange(cc) => {
+                let _ = self.raft_mut().propose_conf_change(context, cc);
+            }
         }
 
         // If log didn't grow proposal failed
-        if index_before == self.raft_mut().raft.raft_log.last_index() && prop.is_fragment() {
-            // Fragment proposals come from client, so respond over network
-            let resp = Response {
-                id: prop.id,
-                to: prop.from,
-                from: self.id,
-                msg: ResponseMsg::IsProposed(false),
-            };
-            self.network.respond_to_client(resp);
-        }
     }
 
     fn on_ready(&mut self) {
@@ -299,7 +304,7 @@ impl Node {
 
         if !ready.snapshot().is_empty() {
             let s = ready.snapshot().clone();
-            store.apply_snapshot(s).expect("Could not apply snapshot");
+            let _ = store.apply_snapshot(s);
         }
 
         self.handle_commited_entries(ready.take_committed_entries());
@@ -344,16 +349,16 @@ impl Node {
                 continue;
             }
 
-            let (prop_id, prop_from) = Proposal::context_from_bytes(entry.get_context());
+            let prop_id = Uuid::from_bytes(entry.get_context().try_into().unwrap());
             match entry.get_entry_type() {
                 EntryType::EntryNormal => {
                     let fragment = Fragment::decode(entry.get_data()).unwrap();
 
                     self.fs.apply(fragment).unwrap();
-                    info!(self.logger, "Applied fragment proposal from {prop_from}");
+                    info!(self.logger, "Applied fragment proposal");
                 }
                 EntryType::EntryConfChange => {
-                    info!(self.logger, "Applied ConfChange proposal from {prop_from}");
+                    info!(self.logger, "Applied ConfChange proposal");
 
                     let mut cc = ConfChange::default();
                     cc.merge(entry.data.as_slice()).unwrap();
@@ -370,9 +375,7 @@ impl Node {
                 if entry.get_entry_type() == EntryType::EntryNormal {
                     let resp = Response {
                         id: prop_id,
-                        to: prop_from,
-                        from: self.id,
-                        msg: ResponseMsg::IsProposed(true),
+                        res: ResponseMsg::WriteFragSuccess(WriteFragResponse { success: true }),
                     };
                     self.network.respond_to_client(resp);
                 } else {

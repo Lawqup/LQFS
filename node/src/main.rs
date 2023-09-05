@@ -3,9 +3,8 @@
 use std::thread;
 
 use cluster::InitResult;
-use network::{Network, Signal};
+use network::{Network, Request, RequestMsg};
 use prelude::*;
-use service::query_server::QueryServer;
 use tonic::transport::Server;
 
 mod cluster;
@@ -16,8 +15,12 @@ mod prelude;
 mod storage;
 
 #[allow(non_snake_case)]
-pub mod service {
-    tonic::include_proto!("service");
+pub mod services {
+    tonic::include_proto!("services");
+}
+
+pub mod messages {
+    tonic::include_proto!("messages");
 }
 
 const N_PEERS: u64 = 3;
@@ -29,25 +32,31 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     let network = Network::new(&peers, logger.clone());
 
-    let query_service = QueryServer::new(network);
-    let _server_handle = thread::spawn(move || async {
-        let addr = "[::1]:50051".parse().unwrap();
-        Server::builder()
-            .add_service(query_service)
-            .serve(addr)
-            .await
-            .unwrap();
-    });
+    // let query_service = QueryServer::new(network);
+    // let _server_handle = thread::spawn(move || async {
+    //     let addr = "[::1]:50051".parse().unwrap();
+    //     Server::builder()
+    //         .add_service(query_service)
+    //         .serve(addr)
+    //         .await
+    //         .unwrap();
+    // });
 
     let InitResult {
         network,
         node_handles,
         ..
-    } = cluster::try_restore_cluster(&peers, &[], &logger)
-        .unwrap_or_else(|_| cluster::init_cluster(&peers, &[], &logger));
+    } = cluster::try_restore_cluster(&peers, &logger)
+        .unwrap_or_else(|_| cluster::init_cluster(&peers, &logger));
 
-    for id in peers {
-        network.send_control_message(id, Signal::Shutdown);
+    for peer in peers {
+        network.request_to_node(
+            peer,
+            Request {
+                id: Uuid::new_v4(),
+                req: RequestMsg::ShutdownNode(ShutdownNodeRequest { to_node: peer }),
+            },
+        )
     }
 
     for handle in node_handles {

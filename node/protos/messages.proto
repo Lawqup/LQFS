@@ -1,0 +1,41 @@
+syntax = "proto3";
+package messages;
+
+message RaftStateRequest {
+  uint64 to_node = 1;
+}
+
+message RaftStateResponse {
+  bool is_leader = 1;
+  bool is_initialized = 2;
+}
+
+message ShutdownNodeRequest {
+  uint64 to_node = 1;
+}
+
+message ReadFileNamesRequest {}
+
+message ReadFileNamesResponse {
+  repeated string file_names = 1;
+}
+
+message Fragment {
+  string file_name = 1;
+  uint64 frag_idx = 2;
+  uint64 total_frags = 3;
+  bytes data = 4;
+}
+
+message WriteFragResponse {
+  bool success = 1;
+}
+
+message ReadFragsRequest {
+  string file_name = 1;
+}
+
+message ReadFragsResponse {
+  repeated Fragment frags = 1;
+}
+

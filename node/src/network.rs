@@ -1,11 +1,7 @@
 //! Deals with the global state across nodes
 
-use crate::{
-    frag::Fragment,
-    prelude::*,
-    service::{query_server, ReadFragsRequest, ReadFragsResponse},
-};
-use raft::{prelude::Message, StateRole};
+use crate::prelude::*;
+use raft::prelude::{ConfChange, Message};
 use tonic::Status;
 use uuid::Uuid;
 
@@ -22,54 +18,51 @@ use std::{
 /// RequestMsgs are all messages sent to nodes
 #[derive(Debug, Clone)]
 pub enum RequestMsg {
-    /// Signals that don't require consensus and don't return a response
-    Control(Signal),
-    /// Queries that don't require consensus and return a response
-    Query(QueryMsg),
-    /// Proposals that require consensus and return a response
+    /// Doesn't require consensus, from client
+    GetRaftState(RaftStateRequest),
+    /// Doesn't require consensus, from client
+    ReadFileNames,
+    /// Doesn't require consensus, from client
+    ReadFrags(ReadFragsRequest),
+    /// Doesn't require consensus, from client
+    ShutdownNode(ShutdownNodeRequest),
+    /// Messages that require consensus
     Propose(Proposal),
-    /// Intra-node messages that drive consensus
-    Raft(Message),
+    /// Messages that drive consensus, from nodes
+    DriveRaft(Message),
 }
 
 #[derive(Debug, Clone)]
-pub enum QueryMsg {
-    GetRaftState {
-        id: Uuid,
-        from: u64,
-    },
-    ReadFrags {
-        id: Uuid,
-        from: u64,
-        file_name: String,
-    },
+pub enum Proposal {
+    WriteFrag(Fragment),
+    ConfChange(ConfChange),
 }
 
 #[derive(Debug, Clone)]
-pub enum Signal {
-    Shutdown,
+pub struct Request {
+    pub id: Uuid,
+    pub req: RequestMsg,
 }
 
 #[derive(Debug, Clone)]
 pub enum ResponseMsg {
-    IsProposed(bool),
     /// The raft state. If the raft isn't initialized yet, is None.
-    RaftState(Option<StateRole>),
-    Frags(Vec<Fragment>),
+    RaftState(RaftStateResponse),
+    FileNames(ReadFileNamesResponse),
+    Frags(ReadFragsResponse),
+    WriteFragSuccess(WriteFragResponse),
 }
 
 #[derive(Debug, Clone)]
 pub struct Response {
     pub id: Uuid,
-    pub to: u64,
-    pub from: u64,
-    pub msg: ResponseMsg,
+    pub res: ResponseMsg,
 }
 
 /// Manages all global state including which nodes are available
 struct NetworkController {
-    raft_senders: HashMap<u64, Sender<RequestMsg>>,
-    raft_recievers: HashMap<u64, Arc<Mutex<Receiver<RequestMsg>>>>,
+    raft_senders: HashMap<u64, Sender<Request>>,
+    raft_recievers: HashMap<u64, Arc<Mutex<Receiver<Request>>>>,
     responses: HashMap<Uuid, Response>,
     logger: Logger,
 }
@@ -93,36 +86,33 @@ impl NetworkController {
         }
     }
 
-    pub fn send_control_message(&self, to: u64, msg: Signal) {
-        if self.raft_senders[&to]
-            .send(RequestMsg::Control(msg))
-            .is_err()
-        {
-            error!(self.logger, "Failed to send control message to {to}");
+    pub fn request_to_node(&self, to: u64, req: Request) {
+        if self.raft_senders[&to].send(req).is_err() {
+            error!(self.logger, "Failed to send request message to {to}");
         }
     }
 
-    pub fn send_query_message(&self, to: u64, msg: QueryMsg) {
-        if self.raft_senders[&to].send(RequestMsg::Query(msg)).is_err() {
-            error!(self.logger, "Failed to send query message to {to}");
+    pub fn request_to_cluster(&self, req: Request) {
+        for (to, sender) in self.raft_senders.iter() {
+            if sender.send(req.clone()).is_err() {
+                error!(self.logger, "Failed to send request message to {to}");
+            }
         }
     }
 
-    pub fn send_proposal_message(&self, to: u64, msg: Proposal) {
-        if self.raft_senders[&to]
-            .send(RequestMsg::Propose(msg))
-            .is_err()
-        {
-            error!(self.logger, "Failed to send proposal message to {to}");
-        }
-    }
-
+    /// TODO: this should be node's job
     pub fn send_raft_messages(&self, msgs: Vec<Message>) {
         for msg in msgs {
             let to = msg.to;
             let from = msg.from;
 
-            if self.raft_senders[&to].send(RequestMsg::Raft(msg)).is_err() {
+            if self.raft_senders[&to]
+                .send(Request {
+                    id: Uuid::new_v4(),
+                    req: RequestMsg::DriveRaft(msg),
+                })
+                .is_err()
+            {
                 error!(
                     self.logger,
                     "Failed to send raft message from {from} to {to}"
@@ -144,16 +134,12 @@ impl Network {
         Network(Arc::new(Mutex::new(NetworkController::new(peers, logger))))
     }
 
-    pub fn send_control_message(&self, to: u64, msg: Signal) {
-        self.0.lock().unwrap().send_control_message(to, msg);
+    pub fn request_to_node(&self, to: u64, req: Request) {
+        self.0.lock().unwrap().request_to_node(to, req);
     }
 
-    pub fn send_query_message(&self, to: u64, msg: QueryMsg) {
-        self.0.lock().unwrap().send_query_message(to, msg);
-    }
-
-    pub fn send_proposal_message(&self, to: u64, msg: Proposal) {
-        self.0.lock().unwrap().send_proposal_message(to, msg);
+    pub fn request_to_cluster(&self, req: Request) {
+        self.0.lock().unwrap().request_to_cluster(req);
     }
 
     pub fn send_raft_messages(&self, msgs: Vec<Message>) {
@@ -174,7 +160,7 @@ impl Network {
             .collect()
     }
 
-    pub fn get_node_reciever(&self, node_id: u64) -> Arc<Mutex<Receiver<RequestMsg>>> {
+    pub fn get_node_reciever(&self, node_id: u64) -> Arc<Mutex<Receiver<Request>>> {
         self.0.lock().unwrap().raft_recievers[&node_id].clone()
     }
 
@@ -207,23 +193,22 @@ impl Network {
     }
 }
 
-#[tonic::async_trait]
-impl query_server::Query for Network {
-    async fn read_frags(
-        &self,
-        request: tonic::Request<ReadFragsRequest>,
-    ) -> std::result::Result<tonic::Response<ReadFragsResponse>, Status> {
-        let inner = request.into_inner();
-        let query = QueryMsg::ReadFrags {
-            id: Uuid::new_v4(),
-            from: inner.from,
-            file_name: inner.file_name,
-        };
+// #[tonic::async_trait]
+// impl query_server::Query for Network {
+//     async fn read_frags(
+//         &self,
+//         request: tonic::Request<ReadFragsRequest>,
+//     ) -> std::result::Result<tonic::Response<ReadFragsResponse>, Status> {
+//         let inner = request.into_inner();
+//         let query = QueryMsg::ReadFrags {
+//             id: Uuid::new_v4(),
+//             file_name: inner.file_name,
+//         };
 
-        for peer in self.peers() {
-            self.send_query_message(peer, query.clone());
-        }
+//         for peer in self.peers() {
+//             self.send_query_message(peer, query.clone());
+//         }
 
-        todo!();
-    }
-}
+//         todo!();
+//     }
+// }

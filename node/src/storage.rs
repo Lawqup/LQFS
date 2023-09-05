@@ -40,6 +40,7 @@ impl NodeStorageCore {
     pub fn restore(id: u64) -> Result<Self> {
         let path = format!("store/metadata-{id}/");
 
+        println!("PATH: {}", path);
         if !Path::new(&path).exists() {
             return Err(Error::InitError);
         }
@@ -433,10 +434,9 @@ impl LogStore for NodeStorage {
     fn compact(&self, index: u64) -> Result<()> {
         let store = &self.0;
 
-        let last_index = store.get_last_index()?;
-        assert!(last_index >= index);
+        assert!(index <= store.get_last_index()? + 1);
 
-        for i in 0..index {
+        for i in store.get_first_index()?..index {
             store.entries_tree.remove(i.to_be_bytes())?;
         }
 

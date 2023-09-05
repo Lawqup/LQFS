@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     thread::{self, JoinHandle},
     time::Duration,
 };
@@ -7,7 +7,7 @@ use std::{
 use slog::Logger;
 
 use crate::{
-    network::{Network, QueryMsg, ResponseMsg},
+    network::{Network, Request, RequestMsg, ResponseMsg},
     node::Node,
     prelude::*,
 };
@@ -17,7 +17,7 @@ pub struct InitResult {
     pub node_handles: Vec<JoinHandle<Node>>,
 }
 
-pub fn init_cluster(peers: &[u64], clients: &[u64], logger: &Logger) -> InitResult {
+pub fn init_cluster(peers: &[u64], logger: &Logger) -> InitResult {
     let network = Network::new(peers, logger.clone());
 
     let mut node_handles = Vec::new();
@@ -43,7 +43,7 @@ pub fn init_cluster(peers: &[u64], clients: &[u64], logger: &Logger) -> InitResu
         leader
     }));
 
-    wait_until_cluster_initialized(clients, peers, network.clone());
+    wait_until_cluster_initialized(peers, network.clone(), logger);
 
     InitResult {
         network,
@@ -51,69 +51,65 @@ pub fn init_cluster(peers: &[u64], clients: &[u64], logger: &Logger) -> InitResu
     }
 }
 
-fn wait_until_cluster_initialized(clients: &[u64], peers: &[u64], network: Network) {
-    let technician = clients.iter().max().copied().unwrap_or_default() + 1;
-
-    let mut still_uninit: HashSet<(u64, Uuid)> = peers
+fn wait_until_cluster_initialized(peers: &[u64], network: Network, logger: &Logger) {
+    let queries: HashMap<u64, Request> = peers
         .iter()
         .copied()
-        .map(|node| (node, Uuid::new_v4()))
+        .map(|node| {
+            (
+                node,
+                Request {
+                    id: Uuid::new_v4(),
+                    req: RequestMsg::GetRaftState(RaftStateRequest { to_node: node }),
+                },
+            )
+        })
         .collect();
 
-    let mut n_leaders = 0;
-    while !still_uninit.is_empty() {
-        let mut to_remove = Vec::new();
+    let mut initialized = HashSet::new();
+    let mut leader_elected = false;
+    for (node, query) in queries.iter().cycle() {
+        network.request_to_node(*node, query.clone());
 
-        for (node, query_id) in still_uninit.iter().copied() {
-            network.send_query_message(
-                node,
-                QueryMsg::GetRaftState {
-                    id: query_id,
-                    from: technician,
-                },
-            );
+        let resp = network.wait_for_response_timeout(query.id, Duration::from_millis(500));
+        if resp.is_none() {
+            continue;
+        }
 
-            match network.wait_for_response(query_id).msg {
-                ResponseMsg::RaftState(Some(raft::StateRole::Leader)) => {
-                    n_leaders += 1;
-                    if n_leaders == 1 {
-                        to_remove.push((node, query_id));
-                    }
-                }
-                ResponseMsg::RaftState(Some(_)) => {
-                    if n_leaders == 1 {
-                        to_remove.push((node, query_id));
-                    }
-                }
-                _ => {}
+        match resp.unwrap().res {
+            ResponseMsg::RaftState(RaftStateResponse { is_leader, .. }) if is_leader => {
+                info!(logger, "Node {node} elected as leader");
+                initialized.insert(node);
+                leader_elected = true;
             }
+            ResponseMsg::RaftState(RaftStateResponse { is_initialized, .. }) if is_initialized => {
+                info!(logger, "Node {node} initialized");
+                initialized.insert(node);
+            }
+            _ => {}
         }
 
-        for q in to_remove.iter() {
-            still_uninit.remove(q);
+        if initialized.len() == peers.len() && leader_elected {
+            break;
         }
-        to_remove.clear();
 
-        thread::sleep(Duration::from_millis(200));
+        thread::sleep(Duration::from_millis(300));
     }
-
-    assert_eq!(n_leaders, 1);
 }
 
 /// Restores the cluster from persistent storage.
 /// At least one node's data must have been initialized.
-pub fn try_restore_cluster(peers: &[u64], clients: &[u64], logger: &Logger) -> Result<InitResult> {
+pub fn try_restore_cluster(peers: &[u64], logger: &Logger) -> Result<InitResult> {
     let network = Network::new(peers, logger.clone());
 
     Ok(InitResult {
         network: network.clone(),
-        node_handles: try_restore_cluster_with_network(peers, clients, logger, network)?,
+        node_handles: try_restore_cluster_with_network(peers, logger, network)?,
     })
 }
 
 fn try_restore_cluster_with_network(
     peers: &[u64],
-    clients: &[u64],
     logger: &Logger,
     network: Network,
 ) -> Result<Vec<JoinHandle<Node>>> {
@@ -141,7 +137,11 @@ fn try_restore_cluster_with_network(
         }));
     }
 
-    wait_until_cluster_initialized(clients, peers, network.clone());
+    error!(logger, "CLUSTER WAITING");
+
+    wait_until_cluster_initialized(peers, network.clone(), logger);
+
+    error!(logger, "CLUSTER INITIALIZED");
 
     Ok(node_handles)
 }
@@ -151,7 +151,7 @@ mod test {
     use std::{
         collections::HashMap,
         env, fs,
-        sync::{Arc, Mutex},
+        sync::{atomic::AtomicBool, Arc, Mutex},
         thread::{self, JoinHandle},
         time::Duration,
     };
@@ -161,15 +161,14 @@ mod test {
 
     use crate::{
         cluster::{init_cluster, try_restore_cluster_with_network, InitResult},
-        frag::Fragment,
-        network::{Network, QueryMsg, ResponseMsg, Signal},
+        network::{Network, Proposal, Request, RequestMsg, ResponseMsg},
         prelude::*,
     };
 
     use crate::node::Node;
 
-    const N_PROPOSALS: usize = 10;
-    const DURATION_PER_PROPOSAL: Duration = Duration::from_millis(100);
+    const N_PROPOSALS: usize = 5;
+    const DURATION_PER_PROPOSAL: Duration = Duration::from_millis(200);
     const CLIENT_TIMEOUT: Duration = Duration::from_millis(5000);
 
     macro_rules! in_temp_dir {
@@ -188,15 +187,19 @@ mod test {
         logger: Logger,
         network: Network,
     ) -> JoinHandle<()> {
-        let proposals: Vec<Proposal> = (0..n_proposals)
+        let proposals: Vec<Request> = (0..n_proposals)
             .map(|i| {
                 let frag = Fragment {
-                    name: client_id.to_string(),
-                    file_idx: i as u64,
+                    file_name: client_id.to_string(),
+                    frag_idx: i as u64,
                     total_frags: n_proposals as u64,
                     data: i.to_le_bytes().to_vec(),
                 };
-                Proposal::new_fragment(client_id, frag)
+
+                Request {
+                    id: Uuid::new_v4(),
+                    req: RequestMsg::Propose(Proposal::WriteFrag(frag)),
+                }
             })
             .collect();
 
@@ -214,10 +217,8 @@ mod test {
                 );
 
                 for prop in proposals_clone.lock().unwrap().iter() {
-                    info!(logger_clone, "CLIENT proposal ({}, {})", prop.id, prop.from);
-                    for peer in network_clone.peers() {
-                        network_clone.send_proposal_message(peer, prop.clone());
-                    }
+                    info!(logger_clone, "CLIENT proposal {}", prop.id);
+                    network_clone.request_to_cluster(prop.clone());
                     thread::sleep(DURATION_PER_PROPOSAL);
                 }
                 thread::sleep(Duration::from_millis(200));
@@ -235,18 +236,16 @@ mod test {
                 );
 
                 let res = res.unwrap();
-                match res.msg {
-                    ResponseMsg::IsProposed(success) => {
+                match res.res {
+                    ResponseMsg::WriteFragSuccess(WriteFragResponse { success }) => {
                         let last = proposals.lock().unwrap().len() - 1;
                         proposals.lock().unwrap().remove(last);
 
-                        assert_eq!(res.to, client_id);
                         assert_eq!(res.id, prop_id);
                         info!(
                             logger,
-                            "Proposal ({}, {}) {}",
+                            "Proposal {} {}",
                             prop_id,
-                            res.to,
                             if success { "SUCCESS" } else { "FAILURE" }
                         );
                     }
@@ -278,72 +277,52 @@ mod test {
         network: Network,
         logger: &Logger,
     ) -> Result<Vec<u8>> {
-        let queries: Vec<(u64, QueryMsg)> = network
-            .peers()
-            .into_iter()
-            .map(|p| {
-                let query = QueryMsg::ReadFrags {
-                    id: Uuid::new_v4(),
-                    from: client_id,
-                    file_name: file_name.to_string(),
-                };
+        let query = Request {
+            id: Uuid::new_v4(),
+            req: RequestMsg::ReadFrags(ReadFragsRequest {
+                file_name: file_name.to_string(),
+            }),
+        };
 
-                (p, query)
-            })
-            .collect();
-
-        let queries = Arc::new(Mutex::new(queries));
-
-        let queries_clone = queries.clone();
+        let query_clone = query.clone();
         let network_clone = network.clone();
+        let got_response = Arc::new(AtomicBool::new(false));
+        let got_response_clone = got_response.clone();
         thread::spawn(move || {
-            while !queries_clone.lock().unwrap().is_empty() {
-                for (to, query) in queries_clone.lock().unwrap().iter() {
-                    network_clone.send_query_message(*to, query.clone());
+            while !got_response_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                network_clone.request_to_cluster(query_clone.clone());
 
-                    thread::sleep(DURATION_PER_PROPOSAL);
-                }
-                thread::sleep(Duration::from_millis(200));
+                thread::sleep(DURATION_PER_PROPOSAL);
             }
         });
 
         let mut frags = HashMap::new();
 
-        while !queries.lock().unwrap().is_empty() {
-            let query_id = match queries.lock().unwrap().last().unwrap() {
-                (_, QueryMsg::ReadFrags { id, .. }) => *id,
-                _ => panic!("Incorrect request variant recieved"),
-            };
+        let res = network.wait_for_response_timeout(query.id, CLIENT_TIMEOUT);
 
-            let res = network.wait_for_response_timeout(query_id, CLIENT_TIMEOUT);
+        assert!(
+            res.is_some(),
+            "Client {client_id} waited too long for response"
+        );
 
-            assert!(
-                res.is_some(),
-                "Client {client_id} waited too long for response"
-            );
+        got_response.store(true, std::sync::atomic::Ordering::Relaxed);
+        let res = res.unwrap();
+        match res.res {
+            ResponseMsg::Frags(f) => {
+                info!(logger, "Client {client_id} got fragment response");
 
-            let res = res.unwrap();
-            match res.msg {
-                ResponseMsg::Frags(f) => {
-                    info!(logger, "Client {client_id} got fragment response");
-
-                    assert_eq!(res.to, client_id);
-                    for frag in f {
-                        frags.insert(frag.file_idx, frag);
-                    }
-
-                    let last = queries.lock().unwrap().len() - 1;
-                    queries.lock().unwrap().remove(last);
+                for frag in f.frags {
+                    frags.insert(frag.frag_idx, frag);
                 }
-                _ => panic!("Incorrect response variant recieved"),
             }
+            _ => panic!("Incorrect response variant recieved"),
         }
 
         if frags.is_empty() || frags.len() as u64 != frags[&0].total_frags {
             Err(Error::FileRetrievalError)
         } else {
             let mut frags: Vec<_> = frags.into_values().collect();
-            frags.sort_by_key(|f| f.file_idx);
+            frags.sort_by_key(|f| f.frag_idx);
             Ok(frags.iter().flat_map(|f| f.data.clone()).collect())
         }
     }
@@ -360,8 +339,14 @@ mod test {
         }
 
         if let Some((peers, node_handles)) = nodes {
-            for id in peers {
-                network.send_control_message(*id, Signal::Shutdown);
+            for &peer in peers {
+                network.request_to_node(
+                    peer,
+                    Request {
+                        id: Uuid::new_v4(),
+                        req: RequestMsg::ShutdownNode(ShutdownNodeRequest { to_node: peer }),
+                    },
+                )
             }
 
             for handle in node_handles {
@@ -383,10 +368,16 @@ mod test {
                 network,
                 node_handles,
                 ..
-            } = init_cluster(&peers, &[], &logger);
+            } = init_cluster(&peers, &logger);
 
-            for id in peers.clone() {
-                network.send_control_message(id, Signal::Shutdown);
+            for &peer in peers.iter() {
+                network.request_to_node(
+                    peer,
+                    Request {
+                        id: Uuid::new_v4(),
+                        req: RequestMsg::ShutdownNode(ShutdownNodeRequest { to_node: peer }),
+                    },
+                )
             }
 
             let mut n_leaders = 0;
@@ -422,7 +413,7 @@ mod test {
                 network,
                 node_handles,
                 ..
-            } = init_cluster(&peers, &clients, &logger);
+            } = init_cluster(&peers, &logger);
 
             let client_handles = spawn_clients(&clients, &logger, network.clone());
 
@@ -459,11 +450,17 @@ mod test {
                 network,
                 node_handles,
                 ..
-            } = init_cluster(&peers, &clients, &logger);
+            } = init_cluster(&peers, &logger);
 
             let client_handles = spawn_clients(&clients, &logger, network.clone());
 
-            network.send_control_message(1, Signal::Shutdown);
+            network.request_to_node(
+                1,
+                Request {
+                    id: Uuid::new_v4(),
+                    req: RequestMsg::ShutdownNode(ShutdownNodeRequest { to_node: 1 }),
+                },
+            );
 
             cleanup(Some(client_handles), Some((&peers, node_handles)), network);
         });
@@ -482,7 +479,7 @@ mod test {
                 network,
                 node_handles,
                 ..
-            } = init_cluster(&peers, &clients, &logger);
+            } = init_cluster(&peers, &logger);
 
             let client_handles = spawn_clients(&clients, &logger, network.clone());
             thread::sleep(Duration::from_millis(100));
@@ -492,8 +489,7 @@ mod test {
             debug!(logger, "ALL NODES SHUTDOWN");
 
             let node_handles =
-                try_restore_cluster_with_network(&peers, &clients, &logger, network.clone())
-                    .unwrap();
+                try_restore_cluster_with_network(&peers, &logger, network.clone()).unwrap();
 
             cleanup(Some(client_handles), Some((&peers, node_handles)), network);
         });

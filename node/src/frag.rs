@@ -7,13 +7,6 @@ use std::{
 
 use crate::prelude::*;
 
-#[allow(non_snake_case)]
-mod fragment {
-    tonic::include_proto!("fragment");
-}
-
-pub use fragment::*;
-
 pub struct FSManager {
     dir: PathBuf,
 }
@@ -30,7 +23,7 @@ impl FSManager {
     /// Persists a fragment at {fs_dir}/{file_name}/{frag_index}:{total_frags_for_file}
     pub fn apply(&self, frag: Fragment) -> Result<()> {
         let dir = self.dir.to_str().unwrap();
-        match fs::create_dir(format!("{dir}/{}", frag.name)) {
+        match fs::create_dir(format!("{dir}/{}", frag.file_name)) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e.into()),
@@ -38,7 +31,7 @@ impl FSManager {
 
         let mut file = fs::File::create(format!(
             "{dir}/{}/{}:{}",
-            frag.name, frag.file_idx, frag.total_frags
+            frag.file_name, frag.frag_idx, frag.total_frags
         ))?;
 
         file.write_all(&frag.data)?;
@@ -62,12 +55,16 @@ impl FSManager {
                 file.read_to_end(&mut data)?;
 
                 Ok(Fragment {
-                    name: file_name.to_owned(),
-                    file_idx: idx.parse().unwrap(),
+                    file_name: file_name.to_owned(),
+                    frag_idx: idx.parse().unwrap(),
                     total_frags: total.parse().unwrap(),
                     data,
                 })
             })
             .collect()
+    }
+
+    pub fn get_file_names(&self) -> Result<Vec<String>> {
+        todo!()
     }
 }

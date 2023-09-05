@@ -1,9 +1,0 @@
-syntax = "proto3";
-package fragment;
-
-message Fragment {
-  string name = 1;
-  uint64 file_idx = 2;
-  uint64 total_frags = 3;
-  bytes data = 4;
-}
