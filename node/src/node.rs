@@ -51,8 +51,6 @@ impl Node {
     pub fn try_restore(id: u64, network: Network, logger: &Logger) -> Result<Self> {
         let logger = logger.new(o!("tag" => format!("node_{id}")));
 
-        info!(logger, "RESTORING");
-
         let storage = NodeStorage::restore(id)?;
 
         let mut config = Self::config();
@@ -65,6 +63,7 @@ impl Node {
         fs::create_dir_all(format!("store/node-{id}/"))
             .expect("Could not create fragment storage directory");
 
+        info!(logger, "RESTORING");
         Ok(Self {
             raft,
             network,
@@ -176,7 +175,6 @@ impl Node {
                 };
                 match req {
                     RequestMsg::DriveRaft(m) => {
-                        info!(self.logger, "Recieved raft message {m:?}");
                         self.step(m);
                     }
                     RequestMsg::Propose(p) => {
@@ -228,8 +226,6 @@ impl Node {
             if elapsed >= Self::TICK_COOLDOWN {
                 now = Instant::now();
                 raft.tick();
-
-                debug!(self.logger, "TICK");
 
                 if let Some(follower) = self.followers_to_add.get(0) {
                     let conf_change = ConfChange {

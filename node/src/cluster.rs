@@ -137,11 +137,11 @@ fn try_restore_cluster_with_network(
         }));
     }
 
-    error!(logger, "CLUSTER WAITING");
+    info!(logger, "CLUSTER WAITING");
 
     wait_until_cluster_initialized(peers, network.clone(), logger);
 
-    error!(logger, "CLUSTER INITIALIZED");
+    info!(logger, "CLUSTER INITIALIZED");
 
     Ok(node_handles)
 }

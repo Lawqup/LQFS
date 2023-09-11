@@ -5,6 +5,7 @@ use std::thread;
 use cluster::InitResult;
 use network::{Network, Request, RequestMsg};
 use prelude::*;
+use services::file_store_server::FileStoreServer;
 use tonic::transport::Server;
 
 mod cluster;
@@ -19,6 +20,7 @@ pub mod services {
     tonic::include_proto!("services");
 }
 
+#[allow(non_snake_case)]
 pub mod messages {
     tonic::include_proto!("messages");
 }
@@ -32,15 +34,15 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     let network = Network::new(&peers, logger.clone());
 
-    // let query_service = QueryServer::new(network);
-    // let _server_handle = thread::spawn(move || async {
-    //     let addr = "[::1]:50051".parse().unwrap();
-    //     Server::builder()
-    //         .add_service(query_service)
-    //         .serve(addr)
-    //         .await
-    //         .unwrap();
-    // });
+    let query_service = FileStoreServer::new(network);
+    let server_handle = thread::spawn(move || async {
+        let addr = "[::1]:50051".parse().unwrap();
+        Server::builder()
+            .add_service(query_service)
+            .serve(addr)
+            .await
+            .unwrap();
+    });
 
     let InitResult {
         network,
@@ -48,6 +50,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         ..
     } = cluster::try_restore_cluster(&peers, &logger)
         .unwrap_or_else(|_| cluster::init_cluster(&peers, &logger));
+
+    server_handle.join().unwrap().await;
 
     for peer in peers {
         network.request_to_node(
@@ -62,7 +66,5 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     for handle in node_handles {
         handle.join().expect("handle could not be joined");
     }
-
-    // server_handle.join().unwrap().await;
     Ok(())
 }

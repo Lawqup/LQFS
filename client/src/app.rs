@@ -2,6 +2,16 @@ use leptos::*;
 use leptos_meta::*;
 use leptos_router::*;
 
+#[allow(non_snake_case)]
+pub mod services {
+    tonic::include_proto!("services");
+}
+
+#[allow(non_snake_case)]
+pub mod messages {
+    tonic::include_proto!("messages");
+}
+
 #[component]
 pub fn App() -> impl IntoView {
     provide_meta_context();

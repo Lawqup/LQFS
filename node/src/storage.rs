@@ -22,7 +22,6 @@ impl NodeStorageCore {
     pub fn create(id: u64) -> Result<Self> {
         let path = format!("store/metadata-{id}/");
 
-        println!("CREATING {path}");
         let db = sled::open(path)?;
 
         let entries_tree = db.open_tree(ENTRIES_TREE)?;
@@ -40,7 +39,6 @@ impl NodeStorageCore {
     pub fn restore(id: u64) -> Result<Self> {
         let path = format!("store/metadata-{id}/");
 
-        println!("PATH: {}", path);
         if !Path::new(&path).exists() {
             return Err(Error::InitError);
         }
@@ -363,7 +361,6 @@ pub trait LogStore: Storage {
 impl LogStore for NodeStorage {
     fn append(&self, entries: &[Entry]) -> Result<()> {
         let store = &self.0;
-        dbg!(entries);
         store.append_entries(entries)?;
 
         store.entries_tree.flush()?;

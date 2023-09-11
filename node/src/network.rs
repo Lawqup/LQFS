@@ -1,6 +1,6 @@
 //! Deals with the global state across nodes
 
-use crate::prelude::*;
+use crate::{prelude::*, services::file_store_server::FileStore};
 use raft::prelude::{ConfChange, Message};
 use tonic::Status;
 use uuid::Uuid;
@@ -193,22 +193,73 @@ impl Network {
     }
 }
 
-// #[tonic::async_trait]
-// impl query_server::Query for Network {
-//     async fn read_frags(
-//         &self,
-//         request: tonic::Request<ReadFragsRequest>,
-//     ) -> std::result::Result<tonic::Response<ReadFragsResponse>, Status> {
-//         let inner = request.into_inner();
-//         let query = QueryMsg::ReadFrags {
-//             id: Uuid::new_v4(),
-//             file_name: inner.file_name,
-//         };
+const SERVER_TIMEOUT: Duration = Duration::from_millis(5000);
 
-//         for peer in self.peers() {
-//             self.send_query_message(peer, query.clone());
-//         }
+#[tonic::async_trait]
+impl FileStore for Network {
+    async fn read_frags(
+        &self,
+        request: tonic::Request<ReadFragsRequest>,
+    ) -> std::result::Result<tonic::Response<ReadFragsResponse>, Status> {
+        let id = Uuid::new_v4();
+        self.request_to_cluster(Request {
+            id,
+            req: RequestMsg::ReadFrags(request.into_inner()),
+        });
 
-//         todo!();
-//     }
-// }
+        match self
+            .wait_for_response_timeout(id, SERVER_TIMEOUT)
+            .map(|r| r.res)
+        {
+            Some(ResponseMsg::Frags(r)) => Ok(tonic::Response::new(r)),
+            None => Err(Status::deadline_exceeded(
+                "Cluster timed out in executing request; try again later",
+            )),
+            _ => panic!("Incorrect response variant recieved"),
+        }
+    }
+
+    async fn read_file_names(
+        &self,
+        _request: tonic::Request<ReadFileNamesRequest>,
+    ) -> std::result::Result<tonic::Response<ReadFileNamesResponse>, Status> {
+        let id = Uuid::new_v4();
+        self.request_to_cluster(Request {
+            id,
+            req: RequestMsg::ReadFileNames,
+        });
+
+        match self
+            .wait_for_response_timeout(id, SERVER_TIMEOUT)
+            .map(|r| r.res)
+        {
+            Some(ResponseMsg::FileNames(r)) => Ok(tonic::Response::new(r)),
+            None => Err(Status::deadline_exceeded(
+                "Cluster timed out in executing request; try again later",
+            )),
+            _ => panic!("Incorrect response variant recieved"),
+        }
+    }
+
+    async fn write_frags(
+        &self,
+        request: tonic::Request<Fragment>,
+    ) -> std::result::Result<tonic::Response<WriteFragResponse>, Status> {
+        let id = Uuid::new_v4();
+        self.request_to_cluster(Request {
+            id,
+            req: RequestMsg::Propose(Proposal::WriteFrag(request.into_inner())),
+        });
+
+        match self
+            .wait_for_response_timeout(id, SERVER_TIMEOUT)
+            .map(|r| r.res)
+        {
+            Some(ResponseMsg::WriteFragSuccess(r)) => Ok(tonic::Response::new(r)),
+            None => Err(Status::deadline_exceeded(
+                "Cluster timed out in executing request; try again later",
+            )),
+            _ => panic!("Incorrect response variant recieved"),
+        }
+    }
+}
