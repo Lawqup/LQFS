@@ -241,7 +241,7 @@ impl FileStore for Network {
         }
     }
 
-    async fn write_frags(
+    async fn write_frag(
         &self,
         request: tonic::Request<Fragment>,
     ) -> std::result::Result<tonic::Response<WriteFragResponse>, Status> {

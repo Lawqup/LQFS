@@ -7,5 +7,5 @@ package services;
 service FileStore {
   rpc ReadFileNames(messages.ReadFileNamesRequest) returns (messages.ReadFileNamesResponse) {}
   rpc ReadFrags(messages.ReadFragsRequest) returns (messages.ReadFragsResponse) {}
-  rpc WriteFrags(messages.Fragment) returns (messages.WriteFragResponse) {}
+  rpc WriteFrag(messages.Fragment) returns (messages.WriteFragResponse) {}
 }

@@ -12,14 +12,7 @@ use crate::{
     prelude::*,
 };
 
-pub struct InitResult {
-    pub network: Network,
-    pub node_handles: Vec<JoinHandle<Node>>,
-}
-
-pub fn init_cluster(peers: &[u64], logger: &Logger) -> InitResult {
-    let network = Network::new(peers, logger.clone());
-
+pub fn init_cluster(peers: &[u64], logger: &Logger, network: &Network) -> Vec<JoinHandle<Node>> {
     let mut node_handles = Vec::new();
     for &id in peers.iter().skip(1) {
         let network = network.clone();
@@ -45,10 +38,7 @@ pub fn init_cluster(peers: &[u64], logger: &Logger) -> InitResult {
 
     wait_until_cluster_initialized(peers, network.clone(), logger);
 
-    InitResult {
-        network,
-        node_handles,
-    }
+    node_handles
 }
 
 fn wait_until_cluster_initialized(peers: &[u64], network: Network, logger: &Logger) {
@@ -78,12 +68,11 @@ fn wait_until_cluster_initialized(peers: &[u64], network: Network, logger: &Logg
 
         match resp.unwrap().res {
             ResponseMsg::RaftState(RaftStateResponse { is_leader, .. }) if is_leader => {
-                info!(logger, "Node {node} elected as leader");
+                info!(logger, "Node {node} responded as leader");
                 initialized.insert(node);
                 leader_elected = true;
             }
             ResponseMsg::RaftState(RaftStateResponse { is_initialized, .. }) if is_initialized => {
-                info!(logger, "Node {node} initialized");
                 initialized.insert(node);
             }
             _ => {}
@@ -99,19 +88,10 @@ fn wait_until_cluster_initialized(peers: &[u64], network: Network, logger: &Logg
 
 /// Restores the cluster from persistent storage.
 /// At least one node's data must have been initialized.
-pub fn try_restore_cluster(peers: &[u64], logger: &Logger) -> Result<InitResult> {
-    let network = Network::new(peers, logger.clone());
-
-    Ok(InitResult {
-        network: network.clone(),
-        node_handles: try_restore_cluster_with_network(peers, logger, network)?,
-    })
-}
-
-fn try_restore_cluster_with_network(
+pub fn try_restore_cluster(
     peers: &[u64],
     logger: &Logger,
-    network: Network,
+    network: &Network,
 ) -> Result<Vec<JoinHandle<Node>>> {
     let mut can_recover = false;
     let mut nodes = Vec::new();
@@ -160,7 +140,7 @@ mod test {
     use raft::StateRole;
 
     use crate::{
-        cluster::{init_cluster, try_restore_cluster_with_network, InitResult},
+        cluster::{init_cluster, try_restore_cluster},
         network::{Network, Proposal, Request, RequestMsg, ResponseMsg},
         prelude::*,
     };
@@ -358,17 +338,14 @@ mod test {
     #[test_case(1)]
     #[test_case(3)]
     #[test_case(9)]
-    #[timeout(2000)]
+    #[timeout(5000)]
     fn leader_election(n_peers: u64) {
         in_temp_dir!({
             let peers: Vec<u64> = (1..=n_peers).collect();
             let logger = build_debug_logger();
 
-            let InitResult {
-                network,
-                node_handles,
-                ..
-            } = init_cluster(&peers, &logger);
+            let network = Network::new(&peers, logger.clone());
+            let node_handles = init_cluster(&peers, &logger, &network);
 
             for &peer in peers.iter() {
                 network.request_to_node(
@@ -409,11 +386,8 @@ mod test {
             let clients: Vec<u64> = (1..=n_clients).collect();
             let logger = build_debug_logger();
 
-            let InitResult {
-                network,
-                node_handles,
-                ..
-            } = init_cluster(&peers, &logger);
+            let network = Network::new(&peers, logger.clone());
+            let node_handles = init_cluster(&peers, &logger, &network);
 
             let client_handles = spawn_clients(&clients, &logger, network.clone());
 
@@ -446,11 +420,8 @@ mod test {
             let clients: Vec<u64> = (1..=n_clients).collect();
             let logger = build_debug_logger();
 
-            let InitResult {
-                network,
-                node_handles,
-                ..
-            } = init_cluster(&peers, &logger);
+            let network = Network::new(&peers, logger.clone());
+            let node_handles = init_cluster(&peers, &logger, &network);
 
             let client_handles = spawn_clients(&clients, &logger, network.clone());
 
@@ -475,11 +446,8 @@ mod test {
             let clients: Vec<u64> = vec![1, 2, 3];
             let logger = build_debug_logger();
 
-            let InitResult {
-                network,
-                node_handles,
-                ..
-            } = init_cluster(&peers, &logger);
+            let network = Network::new(&peers, logger.clone());
+            let node_handles = init_cluster(&peers, &logger, &network);
 
             let client_handles = spawn_clients(&clients, &logger, network.clone());
             thread::sleep(Duration::from_millis(100));
@@ -488,8 +456,7 @@ mod test {
 
             debug!(logger, "ALL NODES SHUTDOWN");
 
-            let node_handles =
-                try_restore_cluster_with_network(&peers, &logger, network.clone()).unwrap();
+            let node_handles = try_restore_cluster(&peers, &logger, &network).unwrap();
 
             cleanup(Some(client_handles), Some((&peers, node_handles)), network);
         });

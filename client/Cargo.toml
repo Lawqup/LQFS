@@ -11,14 +11,28 @@ leptos_meta = { version = "0.5.0-beta2", features = ["csr", "nightly"] }
 leptos_router = { version = "0.5.0-beta2", features = ["csr", "nightly"] }
 log = "0.4"
 gloo-net = { version = "0.2", features = ["http"] }
+gloo-timers = { version = "0.3.0", features = ["futures"] }
+gloo-file = { version = "0.3.0", features = ["futures"] }
 
 prost = "0.11.9"
-tonic = "0.9.2"
+tonic = { version = "0.9.2", default-features = false, features = [
+    "prost",
+    "codegen",
+] }
+tonic-web-wasm-client = "0.4.0"
+tokio = { version = "1.32.0" }
 
-# dependecies for client (enable when csr or hydrate set)
-wasm-bindgen = { version = "0.2" }
 console_log = { version = "1"}
 console_error_panic_hook = { version = "0.1"}
+leptos_icons = { version = "0.0.16-beta", default_features = false, features = [
+             "IoCodeDownloadSharp",
+             "AiPlusOutlined"
+] }
+
+web-sys = { version = "0.3.64", features = [ "Element", "HtmlElement" ] }
+wasm-bindgen = { version = "0.2" }
 
 [build-dependencies]
-tonic-build = "0.9.2"
+tonic-build = { version = "0.9.2", default-features = false, features = [
+    "prost",
+] }

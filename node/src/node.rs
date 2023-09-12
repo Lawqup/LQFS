@@ -184,15 +184,20 @@ impl Node {
                         }
                     }
                     RequestMsg::GetRaftState(r) => {
-                        self.network.respond_to_client(Response {
-                            id,
-                            res: ResponseMsg::RaftState(RaftStateResponse {
-                                is_initialized: self.raft.is_some(),
-                                is_leader: self.is_leader(),
-                            }),
-                        });
+                        if r.to_node == self.id {
+                            self.network.respond_to_client(Response {
+                                id,
+                                res: ResponseMsg::RaftState(RaftStateResponse {
+                                    is_initialized: self.raft.is_some(),
+                                    is_leader: self.is_leader(),
+                                }),
+                            });
+                        }
                     }
                     RequestMsg::ReadFrags(r) => {
+                        if !self.is_leader() {
+                            continue;
+                        }
                         debug!(self.logger, "GOT READ FRAGS QUERY");
                         self.network.respond_to_client(Response {
                             id,
@@ -202,6 +207,9 @@ impl Node {
                         });
                     }
                     RequestMsg::ReadFileNames => {
+                        if !self.is_leader() {
+                            continue;
+                        }
                         debug!(self.logger, "GOT READ FILE NAME QUERY");
                         self.network.respond_to_client(Response {
                             id,
@@ -211,8 +219,10 @@ impl Node {
                         });
                     }
                     RequestMsg::ShutdownNode(r) => {
-                        info!(self.logger, "Shutting down");
-                        return;
+                        if r.to_node == self.id {
+                            info!(self.logger, "Shutting down");
+                            return;
+                        }
                     }
                 };
             }
@@ -256,6 +266,7 @@ impl Node {
                 let index_before = self.raft_mut().raft.raft_log.last_index();
                 let _ = self.raft_mut().propose(context, frag.encode_to_vec());
 
+                // If log didn't grow proposal failed
                 if index_before == self.raft_mut().raft.raft_log.last_index() {
                     // Fragment proposals come from client, so respond over network
                     let resp = Response {
@@ -269,8 +280,6 @@ impl Node {
                 let _ = self.raft_mut().propose_conf_change(context, cc);
             }
         }
-
-        // If log didn't grow proposal failed
     }
 
     fn on_ready(&mut self) {

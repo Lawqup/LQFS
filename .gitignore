@@ -23,4 +23,4 @@ client/node_modules
 client/package-lock.json
 
 # Data stores
-node/store
+node/src/store

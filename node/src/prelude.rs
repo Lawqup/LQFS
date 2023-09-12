@@ -28,6 +28,8 @@ pub fn build_debug_logger() -> Logger {
 pub enum Error {
     #[error("raft error: `{0}`")]
     Raft(#[from] raft::Error),
+    #[error("server error: `{0}`")]
+    Server(#[from] tonic::transport::Error),
     #[error("io error: `{0}`")]
     Io(#[from] std::io::Error),
     #[error("database error: `{0}`")]

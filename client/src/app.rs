@@ -1,20 +1,15 @@
+use crate::FSClient;
 use leptos::*;
 use leptos_meta::*;
 use leptos_router::*;
 
-#[allow(non_snake_case)]
-pub mod services {
-    tonic::include_proto!("services");
-}
-
-#[allow(non_snake_case)]
-pub mod messages {
-    tonic::include_proto!("messages");
-}
+use crate::file::{FileEntry, UploadFileButton};
 
 #[component]
 pub fn App() -> impl IntoView {
     provide_meta_context();
+
+    provide_context(FSClient::new());
 
     view! {
         <Stylesheet id="leptos" href="/pkg/tailwind.css"/>
@@ -29,19 +24,40 @@ pub fn App() -> impl IntoView {
 
 #[component]
 fn Home() -> impl IntoView {
-    let (files, setFiles) = create_signal(None);
+    let files = create_resource(
+        || (),
+        move |_| async move {
+            log!("REQUESTING");
+
+            let client: FSClient = expect_context();
+            client.get_file_names().await
+        },
+    );
 
     view! {
         <div class="my-0 mx-auto max-w-3xl text-center h-screen">
             <h2 class="p-6 text-4xl">"Welcome to LQFS"</h2>
-            <p class="px-10 pb-10 text-left">"Choose a file or upload one."</p>
+            <div class="flex justify-between px-10 pb-4">
 
-            <div class="py-2 h-3/5 bg-gray-500 rounded-lg overflow-auto">
+                <p class="text-left">"Choose a file or upload one."</p>
+                <UploadFileButton/>
+
+            </div>
+
+            <div class="py-2 h-3/5 bg-gray-300 rounded-lg overflow-auto">
                 <ul>
-                    {move || {
-                        if let Some(files) = files() {
-                            files
-                        } else {
+                    {move || match files() {
+                        Some(files) => {
+                            view! {
+                                <For
+                                    each=move || files.clone()
+                                    key=move |c| c.clone()
+
+                                    view=|f| view! { <FileEntry file_name=f/> }
+                                />
+                            }
+                        }
+                        None => {
                             view! {
                                 <For
                                     each=|| (0..20)

@@ -65,6 +65,9 @@ impl FSManager {
     }
 
     pub fn get_file_names(&self) -> Result<Vec<String>> {
-        todo!()
+        Ok(fs::read_dir(&self.dir)?
+            .filter_map(|p| p.ok())
+            .map(|p| p.file_name().to_str().unwrap().to_string())
+            .collect())
     }
 }
